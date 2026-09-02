@@ -1,6 +1,9 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
-    pub uid: String,
+    pub user_id: String,
     pub api_key: String,
     pub secret_key: String,
     pub passphrase: String,
@@ -11,7 +14,7 @@ pub struct Account {
 impl Account {
     pub fn new(
         id: String,
-        uid: String,
+        user_id: String,
         api_key: String,
         secret_key: String,
         passphrase: String,
@@ -20,7 +23,7 @@ impl Account {
     ) -> Self {
         Self {
             id,
-            uid,
+            user_id,
             api_key,
             secret_key,
             passphrase,
