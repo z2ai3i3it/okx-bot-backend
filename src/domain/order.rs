@@ -1,8 +1,8 @@
 use rust_decimal::Decimal;
 
 pub enum Side {
-    Buy,
-    Sell,
+    Buy = 0,
+    Sell = 1,
 }
 
 impl Side {

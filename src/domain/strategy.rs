@@ -1,25 +1,8 @@
 use rust_decimal::Decimal;
 
-/// Fixed ratio rebalance strategy configuration
-pub struct FixdRatioRebalanceConfig {
-    pub initial_capital_b: Decimal,
-    pub initial_capital_q: Decimal,
-    pub base_value_ratio_target: Decimal,
-    pub sell_threshold_ratio_target: Decimal,
-    pub buy_threshold_ratio_target: Decimal,
-    pub maker_fee: Decimal,
-    pub taker_fee: Decimal,
-    pub min_size_b: Decimal,
-    pub decimal_place_price_qb: Decimal,
-    pub decimal_place_amount_b: Decimal,
-    pub decimal_place_total_q: Decimal,
-}
+use crate::domain::strategy::fixed_ratio_rebalance::FixdRatioRebalanceConfig;
+use crate::domain::strategy::grid::GridConfig;
 
-/// Grid strategy configuration (temporary)
-pub struct GridConfig {
-    pub grid_size: Decimal,
-    pub num_grids: u64,
-}
 
 /// Strategy configuration
 enum StrategyConfig {
