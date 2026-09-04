@@ -1,112 +1,139 @@
 # okx-bot-backend
 
-## 🔐 Branch: `feat-auth` — สรุปภาพรวมระบบ Authentication & Authorization
+## 🔐 Core Modules: Authentication & OKX Account Linking
 
-> **Status:** ✅ เสร็จสมบูรณ์ — พร้อม merge เข้า `main`
-> **วันที่เสร็จ:** 2026-09-03
+> **Branches:** `feat-auth`, `feat/okx-account-linking`
+> **Status:** ✅ เสร็จสมบูรณ์ (Auth + Account Linking + AES-256-GCM Encryption)
+> **วันที่อัปเดต:** 2026-09-05
 
-### 📋 สิ่งที่ทำเสร็จแล้ว (Completed Phases)
+### 📋 สิ่งที่ทำเสร็จแล้ว (Completed Modules)
 
-| Phase | รายละเอียด | ไฟล์หลัก |
-|-------|-----------|----------|
-| **Phase 1** — Domain Models & Auth Schemas | นิยาม `User`, `Role`, `UserStatus`, `Claims`, Auth DTOs (`RegisterRequest`, `LoginRequest`, `UserResponse`, `AuthResponse`, `UpdateProfileRequest`, `ChangePasswordRequest`) | `src/domain/user.rs`, `src/domain/account.rs` |
-| **Phase 2** — Auth Service Layer | Argon2id password hashing/verification, JWT (HMAC-SHA256) generation/verification, `process_change_password` | `src/users/auth_service.rs` |
-| **Phase 3** — RBAC & Permission Guard | Enum `Permission` (20+ granular actions), `PermissionGuard` ตรวจสิทธิ์ตาม Role, tenant resource ownership isolation | `src/users/permission.rs` |
-| **Phase 4** — Axum Middleware | `require_auth` (JWT Bearer extraction), `require_admin` (Admin role check) | `src/web/middlewares/auth_middleware.rs` |
-| **Phase 5** — MongoDB Persistence | `init_db` connection pool, `UserRepository` (create, find, update, delete), `AppConfig` env loader | `src/storage/db.rs`, `src/storage/repositories/user_repository.rs`, `src/config.rs` |
-| **Phase 6** — Web Handlers & Full CRUD | Register, Login, Get Profile, Update Profile, Change Password, Soft Delete Account | `src/web/handlers/auth.rs`, `src/web/routes.rs` |
-| **Phase 7** — Swagger UI (OpenAPI 3.0) | `utoipa` + `utoipa-swagger-ui` integration, Bearer auth support, interactive API docs | `src/web/routes.rs` |
+#### 1. ระบบยืนยันตัวตนและจัดการสิทธิ์ (Authentication & RBAC)
+| Feature | รายละเอียด | ไฟล์หลัก |
+|---------|-----------|----------|
+| **Domain Models & Schemas** | นิยาม `User`, `Role` (Admin, Trader, Viewer), `UserStatus`, `Claims`, Auth DTOs | `src/domain/user.rs` |
+| **Auth Service Layer** | Argon2id password hashing/verification, JWT (HMAC-SHA256) token generation/verification | `src/users/auth_service.rs` |
+| **RBAC & Permission Guard** | Enum `Permission` (20+ granular actions), `PermissionGuard` ตรวจสิทธิ์ตาม Role, tenant data isolation | `src/users/permission.rs` |
+| **Axum Middlewares** | `require_auth` (JWT Bearer extraction), `require_admin` (Admin check) | `src/web/middlewares/auth_middleware.rs` |
+| **User Persistence** | `UserRepository` สำหรับ MongoDB collection `users` (CRUD operations) | `src/storage/repositories/user_repository.rs` |
+| **Auth Handlers** | Register, Login, Get Profile, Update Profile, Change Password, Soft Delete | `src/web/handlers/auth.rs` |
 
----
-
-### 🛠️ Tech Stack ที่ใช้ใน feat-auth
-
-| Category | Technology | Version |
-|----------|-----------|---------|
-| Web Framework | Axum | 0.8 |
-| Runtime | Tokio | 1.0 (full) |
-| Database | MongoDB | 3.1 (→ 3.8.2) |
-| Password Hashing | Argon2id | 0.5 |
-| JWT | jsonwebtoken (HMAC-SHA256) | 9.3 |
-| Serialization | serde + serde_json | 1.0 |
-| Date/Time | chrono | 0.4 |
-| UUID | uuid v4 | 1.10 |
-| API Docs | utoipa + utoipa-swagger-ui | 5 / 9 |
-| Config | dotenvy (.env) | 0.15 |
+#### 2. ระบบผูกบัญชี OKX API Key & การเข้ารหัส (Exchange Account & AES-256-GCM)
+| Feature | รายละเอียด | ไฟล์หลัก |
+|---------|-----------|----------|
+| **Two-Way Encryption** | AES-256-GCM Authenticated Encryption (สุ่ม Nonce 96-bit ต่อข้อความ, Output เป็น Base64) | `src/crypto/encryption.rs` |
+| **Account Domain Model** | `Account` entity, `AccountStatus`, `LinkAccountRequest`, `AccountResponse` พร้อม API Key Masking (`c1b2****90ef`) | `src/domain/account.rs` |
+| **Account Persistence** | `AccountRepository` สำหรับ MongoDB collection `accounts` (1 User : N Accounts) | `src/storage/repositories/account_repository.rs` |
+| **Account Service** | Link account (encrypt credentials), list accounts, get account, delete account, get decrypted credentials สำหรับ Bot Engine | `src/users/account_service.rs` |
+| **Account Handlers** | `POST /api/accounts`, `GET /api/accounts`, `GET /api/accounts/:id`, `DELETE /api/accounts/:id` | `src/web/handlers/account.rs` |
+| **OpenAPI / Swagger UI** | Swagger UI (`/swagger-ui`) รองรับ Bearer Auth และ Schema ของทั้ง Auth & Exchange Accounts | `src/web/routes.rs` |
 
 ---
 
-### 🌐 API Endpoints
+### 🛠️ Tech Stack หลัก
 
-#### Public (ไม่ต้อง Token)
+| Category | Technology | Version | Description |
+|----------|-----------|---------|-------------|
+| Web Framework | Axum | 0.8 | Async web framework |
+| Runtime | Tokio | 1.0 (full) | Multi-threaded async runtime |
+| Database | MongoDB | 3.1 (→ 3.8.2) | Official MongoDB Rust Driver |
+| Password Hashing | Argon2id | 0.5 | One-way password hashing |
+| Encryption | aes-gcm | 0.10 | Two-way AES-256-GCM for API Keys/Secrets |
+| Encoding | base64 | 0.22 | Base64 representation of ciphertexts |
+| Token | jsonwebtoken | 9.3 | HMAC-SHA256 Stateless JWT |
+| Stream Utility | futures-util | 0.3 | MongoDB Cursor Stream processing |
+| Serialization | serde + serde_json | 1.0 | Data serialization & JSON |
+| Date/Time | chrono | 0.4 | UTC timestamp tracking |
+| UUID | uuid v4 | 1.10 | Unique ID generation |
+| API Documentation | utoipa + utoipa-swagger-ui | 5 / 9 | OpenAPI 3.0 Interactive Docs |
+| Config | dotenvy | 0.15 | Environment variables loader |
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/api/auth/register` | สมัครสมาชิกใหม่ → ได้รับ JWT Token ทันที |
-| `POST` | `/api/auth/login` | เข้าสู่ระบบ → ได้รับ JWT Token |
+---
 
-#### Protected (ต้องแนบ `Authorization: Bearer <token>`)
+### 🌐 API Endpoints Overview
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/auth/me` | ดูข้อมูลโปรไฟล์ตนเอง |
-| `PUT` | `/api/auth/profile` | แก้ไข username / email |
-| `PUT` | `/api/auth/password` | เปลี่ยนรหัสผ่าน (ต้องใส่รหัสเดิม) |
-| `DELETE` | `/api/auth/account` | ปิดใช้งานบัญชี (Soft Delete → `suspended`) |
+#### 1. Authentication (`/api/auth`)
+| Method | Path | Auth | Description |
+|--------|------|:----:|-------------|
+| `POST` | `/api/auth/register` | Public | สมัครสมาชิกใหม่ → ได้รับ JWT Token |
+| `POST` | `/api/auth/login` | Public | เข้าสู่ระบบ → ได้รับ JWT Token |
+| `GET` | `/api/auth/me` | Bearer | ดูข้อมูลโปรไฟล์ตนเอง |
+| `PUT` | `/api/auth/profile` | Bearer | แก้ไข username / email |
+| `PUT` | `/api/auth/password` | Bearer | เปลี่ยนรหัสผ่าน (ต้องยืนยันรหัสผ่านเดิม) |
+| `DELETE` | `/api/auth/account` | Bearer | ปิดใช้งานบัญชีผู้ใช้ (Soft Delete → `status: "suspended"`) |
 
-#### Testing & Documentation
+#### 2. Exchange Accounts (`/api/accounts`)
+| Method | Path | Auth | Description |
+|--------|------|:----:|-------------|
+| `POST` | `/api/accounts` | Bearer | ผูกบัญชี OKX API Key ใหม่ (เข้ารหัส AES-256-GCM) |
+| `GET` | `/api/accounts` | Bearer | ดูรายการบัญชี OKX ทั้งหมดของผู้ใช้ (แสดงเฉพาะ Masked API Key) |
+| `GET` | `/api/accounts/{id}` | Bearer | ดูรายละเอียดบัญชีเดี่ยวตาม ID |
+| `DELETE` | `/api/accounts/{id}` | Bearer | ยกเลิกการผูกบัญชี OKX |
 
+#### 3. Documentation & Testing
 | Path | Description |
 |------|-------------|
-| `/swagger-ui` | Swagger UI สำหรับทดสอบ API |
+| `/swagger-ui` | Swagger UI Interactive API Documentation |
 | `/api-docs/openapi.json` | OpenAPI 3.0 JSON specification |
 
 ---
 
-### 🏛️ Architecture Decisions
+### 🏛️ Architecture & Security Decisions
 
-1. **Soft Delete** — `DELETE /api/auth/account` เปลี่ยนสถานะ `status` เป็น `"suspended"` แทนการลบ Document จาก MongoDB เพื่อรักษาความสมบูรณ์ของ audit trail, ประวัติการเทรด และ foreign key integrity
-2. **1 User : N Accounts** — ออกแบบให้ 1 User สามารถผูกหลาย OKX Account ได้ (`Account.user_id` เป็น foreign key)
-3. **DTO Layer Filtering** — ข้อมูล `password_hash` จะไม่ถูกส่งผ่าน API response โดยกรองที่ระดับ `UserResponse` DTO (ไม่ใช้ `#[serde(skip_serializing)]` เพราะจะทำให้ MongoDB insert ไม่เก็บค่า)
-4. **Config via `.env`** — Secrets (`MONGODB_URI`, `JWT_SECRET`) เก็บใน `config/secrets.env` โหลดผ่าน `dotenvy`
+1. **Two-Way Encryption (AES-256-GCM)**:
+   - Secret Key และ Passphrase ของ OKX ต้องเข้ารหัสแบบถอดรหัสได้ (Two-way) เพื่อให้บอทเทรดนำไป Sign คำสั่งซื้อขายได้
+   - สุ่ม Nonce 96-bit ใหม่ทุกครั้งที่เข้ารหัส ทำให้ข้อความเดิมได้ Ciphertext ต่างกันเสมอ
+   - เก็บเฉพาะ `encrypted_secret` และ `encrypted_passphrase` ลงใน Database
+2. **API Key Masking**:
+   - ไม่มี endpoint ไหนที่ส่ง Secret หรือ Passphrase ออกมาใน Response
+   - API Key ที่ส่งกลับทาง API จะถูก Masked ตรงกลางเสมอ (เช่น `c1b2****90ef`)
+3. **1 User : N Accounts Relationship**:
+   - 1 ผู้ใช้สามารถมีได้หลายบัญชี OKX (เช่น Demo, Grid Bot, Live Portfolio) โดยแยก Collection `accounts` ชัดเจน และอ้างอิงกลับด้วย `user_id`
+4. **Soft Delete vs Hard Delete**:
+   - การลบบัญชีผู้ใช้ (`/api/auth/account`) ใช้ **Soft Delete** เปลี่ยนสถานะเป็น `suspended` เพื่อรักษา Audit trail และประวัติการเทรด
+   - การลบการผูกบัญชี OKX (`DELETE /api/accounts/{id}`) ใช้ **Hard Delete** เพื่อให้ผู้ใช้สามารถถอดถอน API Key ออกจากระบบได้จริง
+5. **Config via `.env`**:
+   - `ENCRYPTION_KEY`, `JWT_SECRET`, `MONGODB_URI` ถูกแยกเก็บใน `config/secrets.env` ไม่ Hardcode ใน Source code
 
 ---
 
-### 📁 Configuration
+### 📁 Configuration (`config/secrets.env`)
 
 ```env
-# config/secrets.env
 MONGODB_URI=mongodb://localhost:27017
 MONGODB_DB_NAME=okx-bot
-JWT_SECRET=<your-secret-key>
+JWT_SECRET=super-secret-jwt-key-okx-bot-change-me
+JWT_EXPIRATION_HOURS=24
 PORT=3000
+ENCRYPTION_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
 ---
 
-### 🚀 วิธีรัน
+### 🚀 วิธีรันและทดสอบ
 
 ```bash
-# ต้องมี MongoDB รันอยู่ที่ localhost:27017
+# ตรวจสอบโค้ด
+cargo check
+
+# รันเซิร์ฟเวอร์
 cargo run
 
-# เปิดเบราว์เซอร์ไปที่:
-# API Server    → http://localhost:3000
-# Swagger UI    → http://localhost:3000/swagger-ui
+# เข้าทดสอบผ่าน Swagger UI:
+# http://localhost:3000/swagger-ui
 ```
 
 ---
 
-### 🔮 Next Phase (หลัง merge feat-auth เข้า main)
+### 🔮 Next Phase (Roadmap ถัดไป)
 
-> **Phase ถัดไป:** ระบบผูกบัญชี OKX API Key (accounts Collection + AES-256 Encryption)
+> **Phase ถัดไป:** Capital Efficiency Manager (CEM) & Pure OKX v5 Connector (WebSocket / REST Client)
 
-| Component | ไฟล์ | รายละเอียด |
-|-----------|------|-------------|
-| Encryption Service | `src/crypto/encryption.rs` | AES-256 GCM encrypt/decrypt สำหรับ API Key, Secret, Passphrase |
-| Account Repository | `src/storage/repositories/account_repository.rs` | CRUD ใน MongoDB collection `accounts` |
-| Account Service | `src/users/account_service.rs` | Add, List, Delete OKX accounts ของ User |
-| Account Handlers | `src/web/handlers/account.rs` | `POST /api/accounts`, `GET /api/accounts`, `DELETE /api/accounts/:id` |
+| Component | รายละเอียด |
+|-----------|-------------|
+| **OKX Signer & Connector** | `src/okx/signer.rs`, `src/okx/rest_client.rs`, `src/okx/ws_trade.rs` |
+| **CEM Engine** | In-Memory Atomic Balance Tracker & Allocation (`src/capital/ledger.rs`, `allocator.rs`) |
+| **Bot Order Pipeline** | Structured Concurrency Order Pipeline Chain (`src/pipeline/`) |
 
 ---
 

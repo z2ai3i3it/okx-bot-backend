@@ -1,6 +1,6 @@
 use axum::{
     middleware::from_fn_with_state,
-    routing::{get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use utoipa::{
@@ -9,13 +9,20 @@ use utoipa::{
 };
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::domain::user::{
-    AuthResponse, ChangePasswordRequest, GenericMessageResponse, LoginRequest, RegisterRequest,
-    Role, UpdateProfileRequest, UserResponse, UserStatus,
+use crate::domain::{
+    account::{AccountResponse, AccountStatus, LinkAccountRequest},
+    user::{
+        AuthResponse, ChangePasswordRequest, GenericMessageResponse, LoginRequest, RegisterRequest,
+        Role, UpdateProfileRequest, UserResponse, UserStatus,
+    },
 };
 use crate::web::{
-    handlers::auth::{
-        self, change_password, delete_account, get_current_user, login, register, update_profile,
+    handlers::{
+        account::{self, delete_account as delete_linked_account, get_account, link_account, list_accounts},
+        auth::{
+            self as auth_handlers, change_password, delete_account, get_current_user, login,
+            register, update_profile,
+        },
     },
     middlewares::auth_middleware::require_auth,
     state::AppState,
@@ -45,12 +52,16 @@ impl Modify for SecurityAddon {
 #[derive(OpenApi)]
 #[openapi(
     paths(
-        auth::register,
-        auth::login,
-        auth::get_current_user,
-        auth::update_profile,
-        auth::change_password,
-        auth::delete_account
+        auth_handlers::register,
+        auth_handlers::login,
+        auth_handlers::get_current_user,
+        auth_handlers::update_profile,
+        auth_handlers::change_password,
+        auth_handlers::delete_account,
+        account::link_account,
+        account::list_accounts,
+        account::get_account,
+        account::delete_account,
     ),
     components(
         schemas(
@@ -62,12 +73,16 @@ impl Modify for SecurityAddon {
             AuthResponse,
             UpdateProfileRequest,
             ChangePasswordRequest,
-            GenericMessageResponse
+            GenericMessageResponse,
+            AccountStatus,
+            LinkAccountRequest,
+            AccountResponse,
         )
     ),
     modifiers(&SecurityAddon),
     tags(
-        (name = "Authentication", description = "OKX Web Bot User Authentication & Profile Management Endpoints")
+        (name = "Authentication", description = "OKX Web Bot User Authentication & Profile Management Endpoints"),
+        (name = "Exchange Accounts", description = "OKX API Key Linking & Encrypted Account Management Endpoints")
     ),
     info(
         title = "OKX Web Bot API",
@@ -87,9 +102,15 @@ pub fn create_router(state: AppState) -> Router {
     // Protected Auth Routes ต้องมี Token
     let auth_protected_routes = Router::new()
         .route("/me", get(get_current_user))
-        .route("/profile", axum::routing::put(update_profile))
-        .route("/password", axum::routing::put(change_password))
-        .route("/account", axum::routing::delete(delete_account))
+        .route("/profile", put(update_profile))
+        .route("/password", put(change_password))
+        .route("/account", delete(delete_account))
+        .route_layer(from_fn_with_state(state.clone(), require_auth));
+
+    // Protected Exchange Account Routes ต้องมี Token
+    let account_routes = Router::new()
+        .route("/", post(link_account).get(list_accounts))
+        .route("/{id}", get(get_account).delete(delete_linked_account))
         .route_layer(from_fn_with_state(state.clone(), require_auth));
 
     // ผูก Swagger UI เข้ากับ Axum Router
@@ -99,5 +120,6 @@ pub fn create_router(state: AppState) -> Router {
     Router::new()
         .merge(swagger_router)
         .nest("/api/auth", auth_public_routes.merge(auth_protected_routes))
+        .nest("/api/accounts", account_routes)
         .with_state(state)
 }

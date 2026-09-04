@@ -343,3 +343,71 @@
 ## 6. EXPECTED_BEHAVIOR
 - เมื่อเปิดเซิร์ฟเวอร์ สามารถเข้าเว็บ `http://localhost:3000/swagger-ui` เพื่อดูเอกสารและทดสอบยิง API ทุกเส้นทางได้
 - รองรับการนำ Token จาก Login ไปใส่ในปุ่ม `Authorize` เพื่อทดสอบ `/profile`, `/password`, `/me`, `/account` ได้สะดวก
+
+---
+
+# [CHANGE_LOG] 2026-09-05 - Implement OKX Account Linking & AES-256-GCM Encryption
+
+## 1. META_DATA
+- **Feature/Issue:** OKX API Key Management, Two-Way AES-256-GCM Encryption, and Account Endpoints
+- **Target Component:** `crypto/encryption.rs`, `storage/repositories/account_repository.rs`, `users/account_service.rs`, `web/handlers/account.rs`, `domain/account.rs`, `web/routes.rs`, `web/state.rs`, `config.rs`, `main.rs`, `Cargo.toml`
+- **Action Type:** ADD | MODIFY
+
+## 2. MODIFIED_FILES
+- `Cargo.toml`: เพิ่ม dependencies `aes-gcm` และ `base64`
+- `config/secrets.env`: เพิ่มค่าตั้งค่า `ENCRYPTION_KEY` (Master Key 32 bytes)
+- `src/config.rs`: โหลด `encryption_key` เข้าสู่ `AppConfig`
+- `src/crypto/encryption.rs`: สร้าง `EncryptionService` พร้อมตรรกะเข้ารหัส/ถอดรหัส AES-256-GCM (สุ่ม 96-bit Nonce ต่อครั้ง)
+- `src/crypto/mod.rs`: expose โมดูล `encryption`
+- `src/domain/account.rs`: ปรับปรุง `Account` entity, `AccountStatus`, `LinkAccountRequest`, `AccountResponse` (พร้อม API Key masking `xxxx****xxxx` และ Swagger `ToSchema`)
+- `src/storage/repositories/account_repository.rs`: สร้าง `AccountRepository` จัดการ MongoDB collection `accounts` (create, find_by_user_id, find_by_id_and_user_id, delete_by_id_and_user_id)
+- `src/storage/repositories/mod.rs`: expose โมดูล `account_repository`
+- `src/users/account_service.rs`: สร้าง `AccountService` เข้ารหัส Credentials ลับก่อนบันทึก, ตรวจสอบความเป็นเจ้าของบัญชี (Tenant Isolation), และบริการถอดรหัสสำหรับ Bot Engine
+- `src/users/mod.rs`: expose โมดูล `account_service`
+- `src/web/state.rs`: เพิ่ม `account_service: Arc<AccountService>` ใน `AppState`
+- `src/web/handlers/account.rs`: REST API handlers (`link_account`, `list_accounts`, `get_account`, `delete_account`) พร้อม Swagger annotations
+- `src/web/handlers/mod.rs`: expose โมดูล `account`
+- `src/web/routes.rs`: รวม Router `/api/accounts` (ผูก `require_auth` middleware) และลงทะเบียน OpenAPI Specs
+- `src/main.rs`: เริ่มต้น `AccountRepository`, `EncryptionService`, `AccountService` และผูกเข้าสู่ server lifecycle
+
+## 3. CONTEXT_AND_REASON
+- **Problem/Requirement:** ต้องการระบบเชื่อมต่อและจัดเก็บ OKX API Credentials (API Key, Secret Key, Passphrase) ของผู้ใช้อย่างปลอดภัยสูงสุด โดยข้อมูลลับต้องถูกเข้ารหัสแบบ 2 ทิศทาง (Two-Way Encryption) เพื่อให้ Bot Engine สามารถถอดรหัสนำไป Sign คำสั่งซื้อขายได้ แต่ภายนอกและใน Database ไม่สามารถอ่านค่า Plaintext ได้
+- **Previous Behavior:** ไฟล์ `crypto/encryption.rs`, `account_service.rs`, `account_repository.rs`, และ `handlers/account.rs` ยังเป็นไฟล์ว่างเปล่า
+
+## 4. IMPLEMENTATION_DETAILS
+- **[ADDED]:**
+  - `EncryptionService`:
+    - เข้ารหัสด้วย `Aes256Gcm` (AES-256-GCM Authenticated Encryption)
+    - สุ่ม Nonce 96-bit ทุกครั้งที่เข้ารหัส แล้วแพ็ครวมกับ Ciphertext เป็น Base64
+    - ถอดรหัสและ Verify Authentication Tag ป้องกันข้อมูลถูกแก้ไข
+    - Unit tests ทดสอบทั้งการเข้ารหัส-ถอดรหัสกลับมาตรงกัน และความไม่ซ้ำกันของ Ciphertext แม้ข้อความเดิม
+  - `AccountRepository`:
+    - เมทอด `create`, `find_by_id`, `find_by_user_id`, `find_by_id_and_user_id`, `delete_by_id_and_user_id` สำหรับ collection `accounts`
+  - `AccountService`:
+    - `link_account`: Validate input -> Encrypt Secret & Passphrase -> Save -> คืนค่า Masked Response
+    - `list_accounts`: คืนค่ารายการบัญชีทั้งหมดของผู้ใช้ที่เรียก
+    - `get_account`: คืนค่ารายละเอียดบัญชีเฉพาะของตนเอง
+    - `delete_account`: ลบบัญชีเฉพาะของตนเอง
+    - `get_decrypted_credentials`: บริการภายในสำหรับ Bot Engine ถอดรหัส Plaintext Credentials
+  - Handlers ใน `web/handlers/account.rs`:
+    - `POST /api/accounts`: ผูกบัญชีใหม่
+    - `GET /api/accounts`: ดึงรายการบัญชีของฉัน
+    - `GET /api/accounts/:id`: ดึงข้อมูลบัญชีตาม ID
+    - `DELETE /api/accounts/:id`: ยกเลิกการผูกบัญชี
+- **[MODIFIED]:**
+  - `src/domain/account.rs`: เพิ่ม `mask_api_key` ซ่อนอักขระตรงกลางเพื่อความปลอดภัย
+  - `src/web/routes.rs`: นำเข้า schemas และ endpoints เข้า Swagger UI ใน Tag `"Exchange Accounts"`
+- **[DEPRECATED/REMOVED]:**
+  - นำฟิลด์ `accounts: Vec<Account>` ที่ซ้ำซ้อนออกจาก `User` entity เพื่อแยก Collection `accounts` ชัดเจนตามความสัมพันธ์ 1 User : N Accounts
+
+## 5. BREAKING_CHANGES_AND_SIDE_EFFECTS
+- **Breaking Changes:** NO
+- **Dependencies Added:**
+  - `aes-gcm = "0.10"`
+  - `base64 = "0.22"`
+
+## 6. EXPECTED_BEHAVIOR
+- ผู้ใช้สามารถเปิด Swagger UI ที่ `http://localhost:3000/swagger-ui` นำ Bearer Token ไปใส่ แล้วทดสอบผูกบัญชี OKX ผ่าน `POST /api/accounts`
+- ข้อมูล `secret_key` และ `passphrase` ใน MongoDB Collection `accounts` จะถูกเข้ารหัสเป็น Base64 String ที่ไม่สามารถอ่านค่าได้ตรงๆ
+- ค่า API Response และการ Get Accounts จะส่งกลับเฉพาะ Masked API Key เช่น `c1b2****xxxx` ไม่มีการส่ง Secret หรือ Passphrase ออกไปภายนอก
+- บอทเทรดสามารถเรียก `account_service.get_decrypted_credentials(account_id, user_id)` เพื่อดึง Key จริงมา Sign Order ได้อย่างปลอดภัย

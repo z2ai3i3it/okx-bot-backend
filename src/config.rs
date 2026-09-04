@@ -7,6 +7,7 @@ pub struct AppConfig {
     pub jwt_secret: String,
     pub jwt_expiration_hours: i64,
     pub port: u16,
+    pub encryption_key: String,
 }
 
 impl AppConfig {
@@ -30,6 +31,8 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3000),
+            encryption_key: env::var("ENCRYPTION_KEY")
+                .unwrap_or_else(|_| "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string()),
         }
     }
 }

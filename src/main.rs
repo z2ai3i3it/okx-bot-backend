@@ -1,13 +1,18 @@
 pub mod config;
+pub mod crypto;
 pub mod domain;
 pub mod storage;
 pub mod users;
 pub mod web;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use config::AppConfig;
+use crypto::encryption::EncryptionService;
 use storage::db::init_db;
+use storage::repositories::account_repository::AccountRepository;
 use storage::repositories::user_repository::UserRepository;
+use users::account_service::AccountService;
 use users::auth_service::{AuthConfig, AuthService};
 use web::routes::create_router;
 use web::state::AppState;
@@ -29,6 +34,14 @@ async fn main() {
     println!("MongoDB connected successfully!");
 
     let user_repo = UserRepository::new(&db);
+    let account_repo = Arc::new(AccountRepository::new(&db));
+
+    let encryption_service = Arc::new(
+        EncryptionService::new(&app_config.encryption_key)
+            .expect("Failed to initialize EncryptionService with provided ENCRYPTION_KEY"),
+    );
+
+    let account_service = AccountService::new(account_repo.clone(), encryption_service.clone());
 
     let auth_config = AuthConfig {
         jwt_secret: app_config.jwt_secret,
@@ -36,7 +49,7 @@ async fn main() {
     };
     let auth_service = AuthService::new(auth_config);
 
-    let app_state = AppState::new(auth_service, user_repo);
+    let app_state = AppState::new(auth_service, user_repo, account_service);
     let app = create_router(app_state);
 
     let addr = SocketAddr::from(([127, 0, 0, 1], app_config.port));

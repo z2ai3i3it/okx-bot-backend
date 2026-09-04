@@ -2,8 +2,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::domain::account::Account;
-
 /// สิทธิ์การใช้งานระบบของผู้ใช้ (Role-Based Access Control)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -47,10 +45,6 @@ pub struct User {
     pub role: Role,
     pub status: UserStatus,
     
-    /// รายการ Accounts ที่ผูกกับผู้ใช้
-    #[serde(default)]
-    pub accounts: Vec<Account>,
-    
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
@@ -73,7 +67,6 @@ impl User {
             password_hash,
             role: role.unwrap_or_default(),
             status: UserStatus::Active,
-            accounts: Vec::new(),
             created_at: now,
             updated_at: now,
             last_login_at: None,
