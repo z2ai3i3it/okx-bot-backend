@@ -409,5 +409,46 @@
 ## 6. EXPECTED_BEHAVIOR
 - ผู้ใช้สามารถเปิด Swagger UI ที่ `http://localhost:3000/swagger-ui` นำ Bearer Token ไปใส่ แล้วทดสอบผูกบัญชี OKX ผ่าน `POST /api/accounts`
 - ข้อมูล `secret_key` และ `passphrase` ใน MongoDB Collection `accounts` จะถูกเข้ารหัสเป็น Base64 String ที่ไม่สามารถอ่านค่าได้ตรงๆ
-- ค่า API Response และการ Get Accounts จะส่งกลับเฉพาะ Masked API Key เช่น `c1b2****xxxx` ไม่มีการส่ง Secret หรือ Passphrase ออกไปภายนอก
-- บอทเทรดสามารถเรียก `account_service.get_decrypted_credentials(account_id, user_id)` เพื่อดึง Key จริงมา Sign Order ได้อย่างปลอดภัย
+- บอทเทรดสามารถเรียก `account_service.get_decrypted_credentials(account_id, user_id)` เพื่อดึง Key จริงมา Sign Order ได้อย่างปลอดภัย
+
+---
+
+# [CHANGE_LOG] 2026-09-05 - Implement Backend Logout & Token Invalidation via Timestamp
+
+## 1. META_DATA
+- **Feature/Issue:** Backend Logout with Server-Side Token Invalidation (`last_logout_at`)
+- **Target Component:** `domain/user.rs`, `web/middlewares/auth_middleware.rs`, `web/handlers/auth.rs`, `web/routes.rs`
+- **Action Type:** ADD | MODIFY
+
+## 2. MODIFIED_FILES
+- `src/domain/user.rs`: เพิ่มฟิลด์ `last_logout_at: Option<DateTime<Utc>>` ใน Struct `User`
+- `src/web/middlewares/auth_middleware.rs`: อัปเดต `require_auth` ให้ตรวจเช็ค `claims.iat` เทียบกับ `user.last_logout_at` หาก Token ออกมาก่อนหรือตอนกด Logout จะตัดสิทธิ์ทันที (`401 Unauthorized`)
+- `src/web/handlers/auth.rs`: เพิ่ม Handler `POST /api/auth/logout` บันทึกเวลา `last_logout_at = Utc::now()` ลง MongoDB
+- `src/web/routes.rs`: ลงทะเบียน Endpoint `POST /api/auth/logout` ภายใต้ `auth_protected_routes` และเพิ่มลงใน OpenAPI Specs (Swagger UI)
+
+## 3. CONTEXT_AND_REASON
+- **Problem/Requirement:** ป้องกันช่องโหว่ของ Stateless JWT ที่แม้ผู้ใช้จะสั่งออกจากระบบแล้ว แต่หากมีผู้คัดลอก Token ไว้ Token นั้นจะยังนำมายิง API ได้จนกว่าจะหมดอายุ (24 ชม.) จึงต้องมีกลไก Invalidate Token ฝั่งเซิร์ฟเวอร์
+- **Previous Behavior:** ไม่มี Logout API ฝั่ง Backend ต้องพึ่งพาการลบ Token ที่ฝั่ง Client เพียงอย่างเดียว
+
+## 4. IMPLEMENTATION_DETAILS
+- **[ADDED]:**
+  - ฟิลด์ `last_logout_at` ใน `User` entity
+  - Handler `logout`:
+    - รับ JWT Token ผ่าน `require_auth`
+    - ค้นหา User ใน MongoDB แล้วอัปเดต `last_logout_at = Utc::now()`
+    - ส่ง Response ยืนยันการออกจากระบบสำเร็จ
+- **[MODIFIED]:**
+  - `require_auth` Middleware:
+    - ตรวจสอบ `user.is_active()`
+    - ตรวจสอบ `claims.iat <= user.last_logout_at.timestamp()` หากเป็นจริงจะส่งกลับ `401 Unauthorized: Token has been revoked. Please log in again.`
+  - `src/web/routes.rs`: เชื่อมโยงเส้นทาง `/api/auth/logout` พร้อม OpenAPI Document
+
+## 5. BREAKING_CHANGES_AND_SIDE_EFFECTS
+- **Breaking Changes:** NO
+- **Dependencies Added:** ไม่มี
+
+## 6. EXPECTED_BEHAVIOR
+- เมื่อผู้ใช้เรียก `POST /api/auth/logout` สำเร็จ ระบบจะบันทึก Timestamp ล่าสุด
+- Token ปัจจุบันรวมถึง Token เก่าทั้งหมดที่สร้างขึ้นก่อนการ Logout จะไม่สามารถนำกลับมาใช้เรียก Protected Endpoints ได้อีกต่อไป
+- หากต้องการใช้งานใหม่ ผู้ใช้ต้องเข้าสู่ระบบผ่าน `POST /api/auth/login` เพื่อรับ Token ที่มีเวลา `iat` ใหม่กว่า `last_logout_at`
+

@@ -21,7 +21,7 @@ use crate::web::{
         account::{self, delete_account as delete_linked_account, get_account, link_account, list_accounts},
         auth::{
             self as auth_handlers, change_password, delete_account, get_current_user, login,
-            register, update_profile,
+            logout, register, update_profile,
         },
     },
     middlewares::auth_middleware::require_auth,
@@ -54,6 +54,7 @@ impl Modify for SecurityAddon {
     paths(
         auth_handlers::register,
         auth_handlers::login,
+        auth_handlers::logout,
         auth_handlers::get_current_user,
         auth_handlers::update_profile,
         auth_handlers::change_password,
@@ -102,6 +103,7 @@ pub fn create_router(state: AppState) -> Router {
     // Protected Auth Routes ต้องมี Token
     let auth_protected_routes = Router::new()
         .route("/me", get(get_current_user))
+        .route("/logout", post(logout))
         .route("/profile", put(update_profile))
         .route("/password", put(change_password))
         .route("/account", delete(delete_account))

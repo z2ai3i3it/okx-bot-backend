@@ -391,3 +391,45 @@ pub async fn delete_account(
     .into_response())
 }
 
+/// POST /api/auth/logout
+/// ออกจากระบบ (Invalidate Token ทั้งหมดที่ออกก่อนหน้านี้โดยอัปเดต last_logout_at)
+#[utoipa::path(
+    post,
+    path = "/api/auth/logout",
+    tag = "Authentication",
+    security(
+        ("bearer_auth" = [])
+    ),
+    responses(
+        (status = 200, description = "Logged out successfully", body = crate::domain::user::GenericMessageResponse),
+        (status = 401, description = "Unauthorized")
+    )
+)]
+pub async fn logout(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+) -> Result<Response, Response> {
+    let mut user = state
+        .user_repo
+        .find_by_id(&claims.sub)
+        .await
+        .map_err(|e| handle_db_error(e.to_string()))?
+        .ok_or_else(|| handle_auth_error(AuthError::UserNotFound))?;
+
+    let now = Utc::now();
+    user.last_logout_at = Some(now);
+    user.updated_at = now;
+
+    state
+        .user_repo
+        .update(&user)
+        .await
+        .map_err(|e| handle_db_error(e.to_string()))?;
+
+    Ok(Json(json!({
+        "success": true,
+        "message": "Logged out successfully. Token is now invalidated."
+    }))
+    .into_response())
+}
+

@@ -57,6 +57,7 @@
 |--------|------|:----:|-------------|
 | `POST` | `/api/auth/register` | Public | สมัครสมาชิกใหม่ → ได้รับ JWT Token |
 | `POST` | `/api/auth/login` | Public | เข้าสู่ระบบ → ได้รับ JWT Token |
+| `POST` | `/api/auth/logout` | Bearer | ออกจากระบบ (Invalidate Token ทั้งหมดผ่าน `last_logout_at`) |
 | `GET` | `/api/auth/me` | Bearer | ดูข้อมูลโปรไฟล์ตนเอง |
 | `PUT` | `/api/auth/profile` | Bearer | แก้ไข username / email |
 | `PUT` | `/api/auth/password` | Bearer | เปลี่ยนรหัสผ่าน (ต้องยืนยันรหัสผ่านเดิม) |

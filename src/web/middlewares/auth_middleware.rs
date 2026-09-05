@@ -59,6 +59,25 @@ pub async fn require_auth(
     let token = &auth_header[7..]; // ตัด "Bearer " ออก
     match state.auth_service.verify_token(token) {
         Ok(claims) => {
+            // ตรวจสอบสถานะ User และ Invalidate Token หากมีการ Logout หลังจาก Token ถูกออก (claims.iat)
+            let user = match state.user_repo.find_by_id(&claims.sub).await {
+                Ok(Some(u)) => u,
+                Ok(None) => return Err(unauthorized("User account no longer exists")),
+                Err(e) => return Err(unauthorized(&format!("Database error: {}", e))),
+            };
+
+            if !user.is_active() {
+                return Err(forbidden("Account is suspended or inactive"));
+            }
+
+            if let Some(last_logout) = user.last_logout_at {
+                let last_logout_ts = last_logout.timestamp() as usize;
+                // ถ้า claims.iat <= last_logout_ts แสดงว่า Token ถูกสร้างขึ้นก่อนหรือตอนกด Logout
+                if claims.iat <= last_logout_ts {
+                    return Err(unauthorized("Token has been revoked. Please log in again."));
+                }
+            }
+
             // แนบ Claims ลงใน request extensions เพื่อให้ handlers ถัดไปดึงไปใช้ได้ (Extension(claims))
             req.extensions_mut().insert(claims);
             Ok(next.run(req).await)

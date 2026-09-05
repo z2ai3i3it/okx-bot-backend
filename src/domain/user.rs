@@ -48,6 +48,7 @@ pub struct User {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
+    pub last_logout_at: Option<DateTime<Utc>>,
 }
 
 impl User {
@@ -70,6 +71,7 @@ impl User {
             created_at: now,
             updated_at: now,
             last_login_at: None,
+            last_logout_at: None,
         }
     }
 
