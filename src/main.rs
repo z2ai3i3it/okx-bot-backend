@@ -1,6 +1,7 @@
 pub mod config;
 pub mod crypto;
 pub mod domain;
+pub mod okx;
 pub mod storage;
 pub mod users;
 pub mod web;
@@ -9,6 +10,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use config::AppConfig;
 use crypto::encryption::EncryptionService;
+use okx::rest_client::OkxRestClient;
 use storage::db::init_db;
 use storage::repositories::account_repository::AccountRepository;
 use storage::repositories::user_repository::UserRepository;
@@ -41,7 +43,13 @@ async fn main() {
             .expect("Failed to initialize EncryptionService with provided ENCRYPTION_KEY"),
     );
 
-    let account_service = AccountService::new(account_repo.clone(), encryption_service.clone());
+    let okx_rest_client = Arc::new(OkxRestClient::new());
+
+    let account_service = AccountService::new(
+        account_repo.clone(),
+        encryption_service.clone(),
+        okx_rest_client.clone(),
+    );
 
     let auth_config = AuthConfig {
         jwt_secret: app_config.jwt_secret,

@@ -16,9 +16,13 @@ use crate::domain::{
         Role, UpdateProfileRequest, UserResponse, UserStatus,
     },
 };
+use crate::okx::dto::account::{AccountVerificationResult, OkxBalanceDetail};
 use crate::web::{
     handlers::{
-        account::{self, delete_account as delete_linked_account, get_account, link_account, list_accounts},
+        account::{
+            self, delete_account as delete_linked_account, get_account, link_account,
+            list_accounts, verify_account,
+        },
         auth::{
             self as auth_handlers, change_password, delete_account, get_current_user, login,
             logout, register, update_profile,
@@ -63,6 +67,7 @@ impl Modify for SecurityAddon {
         account::list_accounts,
         account::get_account,
         account::delete_account,
+        account::verify_account,
     ),
     components(
         schemas(
@@ -78,6 +83,8 @@ impl Modify for SecurityAddon {
             AccountStatus,
             LinkAccountRequest,
             AccountResponse,
+            AccountVerificationResult,
+            OkxBalanceDetail,
         )
     ),
     modifiers(&SecurityAddon),
@@ -113,6 +120,7 @@ pub fn create_router(state: AppState) -> Router {
     let account_routes = Router::new()
         .route("/", post(link_account).get(list_accounts))
         .route("/{id}", get(get_account).delete(delete_linked_account))
+        .route("/{id}/verify", post(verify_account))
         .route_layer(from_fn_with_state(state.clone(), require_auth));
 
     // ผูก Swagger UI เข้ากับ Axum Router

@@ -70,6 +70,7 @@
 | `GET` | `/api/accounts` | Bearer | ดูรายการบัญชี OKX ทั้งหมดของผู้ใช้ (แสดงเฉพาะ Masked API Key) |
 | `GET` | `/api/accounts/{id}` | Bearer | ดูรายละเอียดบัญชีเดี่ยวตาม ID |
 | `DELETE` | `/api/accounts/{id}` | Bearer | ยกเลิกการผูกบัญชี OKX |
+| `POST` | `/api/accounts/{id}/verify` | Bearer | ตรวจสอบสุขภาพ Key และทดสอบดึง Asset Balance จาก OKX v5 จริง |
 
 #### 3. Documentation & Testing
 | Path | Description |

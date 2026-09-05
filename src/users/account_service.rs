@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::{
     crypto::encryption::{CryptoError, EncryptionService},
     domain::account::{Account, AccountResponse, LinkAccountRequest},
+    okx::{dto::account::AccountVerificationResult, rest_client::OkxRestClient},
     storage::repositories::account_repository::AccountRepository,
 };
 
@@ -26,16 +27,19 @@ pub enum AccountServiceError {
 pub struct AccountService {
     account_repo: Arc<AccountRepository>,
     encryption_service: Arc<EncryptionService>,
+    okx_rest_client: Arc<OkxRestClient>,
 }
 
 impl AccountService {
     pub fn new(
         account_repo: Arc<AccountRepository>,
         encryption_service: Arc<EncryptionService>,
+        okx_rest_client: Arc<OkxRestClient>,
     ) -> Self {
         Self {
             account_repo,
             encryption_service,
+            okx_rest_client,
         }
     }
 
@@ -150,5 +154,37 @@ impl AccountService {
             .decrypt(&account.encrypted_passphrase)?;
 
         Ok((account.api_key, secret, passphrase))
+    }
+
+    /// ตรวจสอบความถูกต้องของ API Key ใน Database กับเซิร์ฟเวอร์ OKX
+    pub async fn verify_account(
+        &self,
+        account_id: &str,
+        user_id: &str,
+    ) -> Result<AccountVerificationResult, AccountServiceError> {
+        let account = self
+            .account_repo
+            .find_by_id_and_user_id(account_id, user_id)
+            .await?
+            .ok_or(AccountServiceError::AccountNotFound)?;
+
+        let secret = self
+            .encryption_service
+            .decrypt(&account.encrypted_secret)?;
+        let passphrase = self
+            .encryption_service
+            .decrypt(&account.encrypted_passphrase)?;
+
+        let result = self
+            .okx_rest_client
+            .verify_credentials(
+                &account.api_key,
+                &secret,
+                &passphrase,
+                account.is_simulated,
+            )
+            .await;
+
+        Ok(result)
     }
 }

@@ -451,4 +451,58 @@
 - เมื่อผู้ใช้เรียก `POST /api/auth/logout` สำเร็จ ระบบจะบันทึก Timestamp ล่าสุด
 - Token ปัจจุบันรวมถึง Token เก่าทั้งหมดที่สร้างขึ้นก่อนการ Logout จะไม่สามารถนำกลับมาใช้เรียก Protected Endpoints ได้อีกต่อไป
 - หากต้องการใช้งานใหม่ ผู้ใช้ต้องเข้าสู่ระบบผ่าน `POST /api/auth/login` เพื่อรับ Token ที่มีเวลา `iat` ใหม่กว่า `last_logout_at`
+
+---
+
+# [CHANGE_LOG] 2026-09-05 - Implement Pure OKX v5 Connector (Signer & REST Balance Verification)
+
+## 1. META_DATA
+- **Feature/Issue:** OKX v5 Authentication Signer, REST Client, and Account Verification Endpoint
+- **Target Component:** `okx/signer.rs`, `okx/dto/account.rs`, `okx/rest_client.rs`, `okx/mod.rs`, `users/account_service.rs`, `web/handlers/account.rs`, `web/routes.rs`, `main.rs`, `Cargo.toml`
+- **Action Type:** ADD | MODIFY
+
+## 2. MODIFIED_FILES
+- `Cargo.toml`: เพิ่ม dependencies `reqwest` (json), `hmac`, `sha2`
+- `src/okx/signer.rs`: สร้าง `OkxSigner` สำหรับคำนวณลายเซ็น HMAC-SHA256 Base64 ตามกฎ OKX v5 (`timestamp + method + path + body`) และสร้าง ISO 8601 UTC Timestamp
+- `src/okx/dto/account.rs`: นิยาม DTOs สำหรับข้อมูล Balance ของ OKX (`OkxBalanceDetail`, `OkxAccountBalanceData`, `OkxApiResponse`, `AccountVerificationResult`) พร้อม `ToSchema`
+- `src/okx/rest_client.rs`: สร้าง `OkxRestClient` ยิง `GET /api/v5/account/balance` พร้อมแนบ Headers (`OK-ACCESS-KEY`, `OK-ACCESS-SIGN`, `OK-ACCESS-TIMESTAMP`, `OK-ACCESS-PASSPHRASE`, `x-simulated-trading`)
+- `src/okx/mod.rs`: expose โมดูล `dto`, `rest_client`, `signer`
+- `src/users/account_service.rs`: เพิ่มเมทอด `verify_account(account_id, user_id)` ดึง Credentials ที่เข้ารหัสไว้มาถอดรหัสใน Memory แล้วเรียก `OkxRestClient::verify_credentials`
+- `src/web/handlers/account.rs`: เพิ่ม Handler `POST /api/accounts/{id}/verify` ทดสอบยิงไปกระดาน OKX จริงและส่งผลลัพธ์ยอดคงเหลือกลับ
+- `src/web/routes.rs`: ลงทะเบียน Endpoint `POST /api/accounts/{id}/verify` และลงทะเบียน DTO Schemas ใน OpenAPI / Swagger UI
+- `src/main.rs`: expose โมดูล `okx` และเริ่มต้น `OkxRestClient` ส่งเข้า `AccountService`
+
+## 3. CONTEXT_AND_REASON
+- **Problem/Requirement:** ต้องการให้ระบบสามารถติดต่อสื่อสารกับ OKX v5 API ได้อย่างถูกต้องด้วยการลงลายเซ็น Cryptographic HMAC-SHA256 และสามารถทดสอบดึง Asset Balance ของบัญชีที่ผูกไว้ เพื่อยืนยันว่า API Key/Secret/Passphrase ถูกต้องและมีสิทธิ์ใช้งานจริง
+- **Previous Behavior:** โฟลเดอร์ `src/okx` ยังเป็นไฟล์ว่างเปล่า ระบบยังไม่สามารถติดต่อกับ Exchange ได้
+
+## 4. IMPLEMENTATION_DETAILS
+- **[ADDED]:**
+  - `OkxSigner`:
+    - `generate_timestamp()`: คืนค่า ISO8601 UTC format เช่น `2020-12-08T09:08:57.715Z`
+    - `sign()`: คำนวณ HMAC-SHA256 ของ prehash string แล้วแปลงเป็น Base64
+    - Unit tests ทดสอบทั้ง timestamp format และลายเซ็น HMAC
+  - `OkxRestClient`:
+    - `get_balance()`: จัดเตรียม Headers พร้อม Signer แล้วยิง HTTP GET ไปยัง `https://www.okx.com/api/v5/account/balance`
+    - `verify_credentials()`: Wrapper สำหรับตรวจสอบสุขภาพของ API Key และดึงยอดคงเหลือ (USDT / BTC / Coins)
+  - `AccountVerificationResult`: สรุปผลลัพธ์ `is_valid`, `message`, `total_equity_usd`, `balances`
+  - Endpoint `POST /api/accounts/{id}/verify`
+- **[MODIFIED]:**
+  - `AccountService`: เชื่อมโยง `Arc<OkxRestClient>` เพื่อดึงข้อมูลสำหรับ Verify
+  - `src/web/routes.rs`: เพิ่ม OpenAPI Spec ในกลุ่ม `Exchange Accounts`
+
+## 5. BREAKING_CHANGES_AND_SIDE_EFFECTS
+- **Breaking Changes:** NO
+- **Dependencies Added:**
+  - `reqwest = { version = "0.12", features = ["json"] }`
+  - `hmac = "0.12"`
+  - `sha2 = "0.10"`
+
+## 6. EXPECTED_BEHAVIOR
+- ผู้ใช้สามารถเปิด Swagger UI ที่ `http://localhost:3000/swagger-ui`
+- เลือก `POST /api/accounts/{id}/verify` ระบุ ID ของ Account ที่ผูกไว้
+- ระบบจะถอดรหัส Key ใน Memory และยิงไปเช็คกับ OKX จริง:
+  - หาก Key ถูกต้อง: ส่งกลับ `is_valid: true`, ยอด `total_equity_usd` และรายการเหรียญคงเหลือ
+  - หาก Key ไม่ถูกต้อง/Passphrase ผิด: ส่งกลับ `is_valid: false` พร้อม Error Message จาก OKX เช่น `50111: Invalid Sign` หรือ `50100: User does not exist`
+
 

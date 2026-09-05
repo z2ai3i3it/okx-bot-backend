@@ -11,6 +11,7 @@ use crate::{
         account::{AccountResponse, LinkAccountRequest},
         user::{Claims, GenericMessageResponse},
     },
+    okx::dto::account::AccountVerificationResult,
     users::account_service::AccountServiceError,
     web::state::AppState,
 };
@@ -137,6 +138,32 @@ pub async fn delete_account(
             }),
         )
             .into_response(),
+        Err(err) => handle_account_error(err).into_response(),
+    }
+}
+
+/// ตรวจสอบการเชื่อมต่อ OKX API Key กับเซิร์ฟเวอร์ OKX โดยตรง (ทดสอบดึง Balance)
+#[utoipa::path(
+    post,
+    path = "/api/accounts/{id}/verify",
+    tag = "Exchange Accounts",
+    security(("bearer_auth" = [])),
+    params(
+        ("id" = String, Path, description = "Account ID")
+    ),
+    responses(
+        (status = 200, description = "OKX Verification result", body = AccountVerificationResult),
+        (status = 404, description = "Account not found", body = GenericMessageResponse),
+        (status = 401, description = "Unauthorized", body = GenericMessageResponse)
+    )
+)]
+pub async fn verify_account(
+    State(state): State<AppState>,
+    Extension(claims): Extension<Claims>,
+    Path(account_id): Path<String>,
+) -> impl IntoResponse {
+    match state.account_service.verify_account(&account_id, &claims.sub).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
         Err(err) => handle_account_error(err).into_response(),
     }
 }
