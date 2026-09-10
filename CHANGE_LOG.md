@@ -505,4 +505,61 @@
   - หาก Key ถูกต้อง: ส่งกลับ `is_valid: true`, ยอด `total_equity_usd` และรายการเหรียญคงเหลือ
   - หาก Key ไม่ถูกต้อง/Passphrase ผิด: ส่งกลับ `is_valid: false` พร้อม Error Message จาก OKX เช่น `50111: Invalid Sign` หรือ `50100: User does not exist`
 
+---
+
+# [CHANGE_LOG] 2026-09-10 - Implement Pure OKX v5 WebSocket Client & Hierarchical Rate Limiter
+
+## 1. META_DATA
+- **Feature/Issue:** Pure OKX v5 WebSocket Client (Public Data Feed + Private Trade Dispatcher) and Hierarchical Rate Limiter Engine
+- **Target Component:** `okx/rate_limiter.rs`, `okx/ws_client.rs`, `okx/ws_trade.rs`, `okx/manager.rs`, `okx/dto/market.rs`, `okx/dto/trade.rs`, `okx/mod.rs`, `Cargo.toml`
+- **Action Type:** ADD | MODIFY
+
+## 2. MODIFIED_FILES
+- `Cargo.toml`: เพิ่ม dependencies `tokio-tungstenite = { version = "0.26", features = ["native-tls"] }` และ `tracing = "0.1"`
+- `src/okx/rate_limiter.rs`: สร้าง Hierarchical Token Bucket Engine (Sub-account 1,000 req/2s, Single Place 60/2s, Batch Place 300/2s, Cancel/Amend 60/2s, General REST Endpoints) รองรับทั้ง `try_acquire` (non-blocking) และ `acquire` (async wait)
+- `src/okx/dto/market.rs`: สร้าง DTOs สำหรับ Public WebSocket Market Data (`WsSubscriptionArg`, `WsRequest`, `WsEventResponse`, `OkxTickerData`, `WsDataMessage`)
+- `src/okx/dto/trade.rs`: สร้าง DTOs สำหรับ WebSocket Private Login (`WsLoginArg`), Order Placement (`WsPlaceOrderArg`), และผลลัพธ์ (`WsOrderResult`)
+- `src/okx/dto/mod.rs`: expose `market` และ `trade`
+- `src/okx/ws_client.rs`: สร้าง `OkxPublicWsClient` จัดการการเชื่อมต่อ Public WebSocket (`wss://ws.okx.com:8443/ws/v5/public`) พร้อม Ping-Pong Heartbeat ทุก 20 วินาที (ป้องกัน 30s idle disconnect), Auto-reconnect with Exponential Backoff (เคารพ limit 3 req/sec), และ Broadcast channel
+- `src/okx/ws_trade.rs`: สร้างโครงสร้าง `OkxWsTradeClient` สำหรับยิงคำสั่งซื้อขายผ่าน WebSocket Private API
+- `src/okx/manager.rs`: สร้าง `OkxManager` เป็น Connection Pool Controller ถือ Public WS กลาง และจัดการ Registry ของ `OkxRateLimiter` แยกตาม Sub-account
+- `src/okx/mod.rs`: expose โมดูล `dto`, `manager`, `rate_limiter`, `rest_client`, `signer`, `ws_client`, `ws_trade`
+
+## 3. CONTEXT_AND_REASON
+- **Problem/Requirement:** 
+  1. การส่งคำสั่งซื้อขายของบอทจำเป็นต้องควบคุม Rate Limit อย่างเคร่งครัดตามกฎ OKX v5 เพื่อป้องกัน Error 50011 และ Error 50061 (Sub-account order cap)
+  2. การดึงราคาตลาดด้วย REST Polling มีความหน่วงสูงและสิ้นเปลืองโควต้า จึงต้องมี Public WebSocket Client รับข้อมูลราคาแบบ Real-time พร้อมกลไก Heartbeat ป้องกันการตัดสาย
+  3. สถาปัตยกรรมต้องแยกส่วนชัดเจน: Layer `src/okx` เป็น Pure Exchange Driver ไม่เอาตรรกะของบอทหรือ Order Lifecycle มาปะปน
+- **Previous Behavior:** มีเพียง REST Client ดึงยอดคงเหลือ ยังไม่มีตัวจัดการ Rate Limiter และไม่มี WebSocket Client สำหรับรับข้อมูลตลาดสด
+
+## 4. IMPLEMENTATION_DETAILS
+- **[ADDED]:**
+  - `OkxRateLimiter`:
+    - `TokenBucket`: คำนวณ continuous refill ตามเวลา elapsed
+    - `try_acquire_order`: ตรวจสอบและหักโควต้า 2 ชั้น (Sub-account หักตามจำนวน N orders จริง, Instrument หัก 1 token สำหรับ Single 60/2s หรือ Batch 300/2s) พร้อม Rollback อัตโนมัติหากชั้นที่สองไม่ผ่าน
+    - `acquire_order`: Async loop รอพร้อม timeout ป้องกันการรอค้างเติ่ง
+    - `try_acquire_endpoint`: คุมโควต้าของ REST API ทั่วไป
+  - `OkxPublicWsClient`:
+    - Singleton Hub pattern สำหรับกระจายข้อมูลราคาผ่าน `broadcast::channel`
+    - Batch subscription เพื่อไม่ให้เกินโควต้า 480 sub/hr
+    - Heartbeat Timer ส่ง raw text `"ping"` ทุก 20 วินาที
+    - Reconnection Backoff (1s, 2s, 4s, ..., สูงสุด 30s)
+  - `OkxWsTradeClient` & `OkxManager`:
+    - จัดเตรียม Helper สร้าง HMAC-SHA256 Signed Login Payload
+    - Registry แม็พ Sub-account เข้ากับ `OkxRateLimiter` ประจำตัว
+  - Unit tests ใน `rate_limiter.rs` และ Live integration test สตรีมราคา `BTC-USDT` ใน `ws_client.rs`
+- **[MODIFIED]:**
+  - `src/okx/mod.rs` และ `src/okx/dto/mod.rs`: expose โมดูลใหม่ครบถ้วน
+
+## 5. BREAKING_CHANGES_AND_SIDE_EFFECTS
+- **Breaking Changes:** NO
+- **Dependencies Added:**
+  - `tokio-tungstenite = { version = "0.26", features = ["native-tls"] }`
+  - `tracing = "0.1"`
+
+## 6. EXPECTED_BEHAVIOR
+- ระบบสามารถทดสอบ Unit Test ผ่าน `cargo test --bin okx-bot-backend` (14 passed)
+- สามารถรัน `cargo test --bin okx-bot-backend -- ws_client --nocapture` เพื่อทดสอบต่อ Public WebSocket สตรีมราคาเหรียญ BTC-USDT จริงกลับมาได้สำเร็จ
+- การส่งคำสั่งในโมดูลถัดไป (Order Pipeline) จะสามารถขอ Permit จาก `OkxRateLimiter` เพื่อการันตีว่าจะไม่เกิด Error 50011 หรือ 50061
+
 

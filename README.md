@@ -1,10 +1,10 @@
 # okx-bot-backend
 
-## 🔐 Core Modules: Authentication & OKX Account Linking
+## 🔐 Core Modules: Authentication, OKX Linking & Pure OKX v5 Connector
 
-> **Branches:** `feat-auth`, `feat/okx-account-linking`
-> **Status:** ✅ เสร็จสมบูรณ์ (Auth + Account Linking + AES-256-GCM Encryption)
-> **วันที่อัปเดต:** 2026-09-05
+> **Branches:** `feat-auth`, `feat/okx-account-linking`, `feat/okx-signer-rest`, `feat/okx-v5-ws-ratelimit`
+> **Status:** ✅ เสร็จสมบูรณ์ (Auth + OKX Linking + Signer + REST + WebSocket + Hierarchical Rate Limiter)
+> **วันที่อัปเดต:** 2026-09-10
 
 ### 📋 สิ่งที่ทำเสร็จแล้ว (Completed Modules)
 
@@ -16,7 +16,7 @@
 | **RBAC & Permission Guard** | Enum `Permission` (20+ granular actions), `PermissionGuard` ตรวจสิทธิ์ตาม Role, tenant data isolation | `src/users/permission.rs` |
 | **Axum Middlewares** | `require_auth` (JWT Bearer extraction), `require_admin` (Admin check) | `src/web/middlewares/auth_middleware.rs` |
 | **User Persistence** | `UserRepository` สำหรับ MongoDB collection `users` (CRUD operations) | `src/storage/repositories/user_repository.rs` |
-| **Auth Handlers** | Register, Login, Get Profile, Update Profile, Change Password, Soft Delete | `src/web/handlers/auth.rs` |
+| **Auth Handlers** | Register, Login, Logout (`last_logout_at`), Get Profile, Update Profile, Change Password, Soft Delete | `src/web/handlers/auth.rs` |
 
 #### 2. ระบบผูกบัญชี OKX API Key & การเข้ารหัส (Exchange Account & AES-256-GCM)
 | Feature | รายละเอียด | ไฟล์หลัก |
@@ -25,8 +25,17 @@
 | **Account Domain Model** | `Account` entity, `AccountStatus`, `LinkAccountRequest`, `AccountResponse` พร้อม API Key Masking (`c1b2****90ef`) | `src/domain/account.rs` |
 | **Account Persistence** | `AccountRepository` สำหรับ MongoDB collection `accounts` (1 User : N Accounts) | `src/storage/repositories/account_repository.rs` |
 | **Account Service** | Link account (encrypt credentials), list accounts, get account, delete account, get decrypted credentials สำหรับ Bot Engine | `src/users/account_service.rs` |
-| **Account Handlers** | `POST /api/accounts`, `GET /api/accounts`, `GET /api/accounts/:id`, `DELETE /api/accounts/:id` | `src/web/handlers/account.rs` |
+| **Account Handlers** | `POST /api/accounts`, `GET /api/accounts`, `GET /api/accounts/:id`, `DELETE /api/accounts/:id`, `POST /api/accounts/:id/verify` | `src/web/handlers/account.rs` |
 | **OpenAPI / Swagger UI** | Swagger UI (`/swagger-ui`) รองรับ Bearer Auth และ Schema ของทั้ง Auth & Exchange Accounts | `src/web/routes.rs` |
+
+#### 3. Pure OKX v5 Connector & Rate Limiter (Exchange Layer)
+| Feature | รายละเอียด | ไฟล์หลัก |
+|---------|-----------|----------|
+| **OKX v5 Signer** | HMAC-SHA256 Base64 Signer สำหรับ Auth Headers และ WS Login ตามมาตรฐาน OKX v5 | `src/okx/signer.rs` |
+| **REST Balance Client** | ตรวจสอบยอดเงินจริงและทดสอบความถูกต้องของ Key ผ่าน `GET /api/v5/account/balance` | `src/okx/rest_client.rs` |
+| **Hierarchical Rate Limiter** | Multi-level Token Bucket: Sub-account (1,000 req/2s) ป้องกัน 50061, Instrument Single (60/2s), Batch (300/2s) ป้องกัน 50011 | `src/okx/rate_limiter.rs` |
+| **Public WebSocket Client** | Singleton Hub สตรีมราคาตลาดสด (Tickers, BBO) พร้อม Heartbeat Ping/Pong 20s และ Reconnect Backoff | `src/okx/ws_client.rs` |
+| **WS Trade & Connection Pool** | Dispatcher คำสั่งซื้อขายความเร็วสูงผ่าน WS พร้อม `OkxManager` จัดการ Pool แยกตาม Sub-account | `src/okx/ws_trade.rs`, `src/okx/manager.rs` |
 
 ---
 
@@ -129,13 +138,14 @@ cargo run
 
 ### 🔮 Next Phase (Roadmap ถัดไป)
 
-> **Phase ถัดไป:** Capital Efficiency Manager (CEM) & Pure OKX v5 Connector (WebSocket / REST Client)
+> **Phase ถัดไป:** Capital Efficiency Manager (CEM) & Structured Order Pipeline
 
-| Component | รายละเอียด |
-|-----------|-------------|
-| **OKX Signer & Connector** | `src/okx/signer.rs`, `src/okx/rest_client.rs`, `src/okx/ws_trade.rs` |
-| **CEM Engine** | In-Memory Atomic Balance Tracker & Allocation (`src/capital/ledger.rs`, `allocator.rs`) |
-| **Bot Order Pipeline** | Structured Concurrency Order Pipeline Chain (`src/pipeline/`) |
+| Component | รายละเอียด | ไฟล์เป้าหมาย |
+|-----------|-------------|--------------|
+| **CEM Ledger Engine** | In-Memory Atomic Balance Tracker per Account & Asset (Zero-delay Balance Check) | `src/capital/ledger.rs` |
+| **CEM Allocator** | Reserve / Release Balance Operations สำหรับจัดสรรวงเงินให้แต่ละ Strategy | `src/capital/allocator.rs` |
+| **Smart Parking Planner** | คำนวณและดึงทุนกลับเมื่อวงเงินไม่พอ | `src/capital/planner.rs` |
+| **Order Pipeline Chain** | Step 1: Dedup -> Step 2: CEM Gatekeeper -> Step 3: Rate Limiter -> Step 4: OKX WS Executor | `src/pipeline/` |
 
 ---
 
