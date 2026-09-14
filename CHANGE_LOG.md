@@ -562,4 +562,130 @@
 - สามารถรัน `cargo test --bin okx-bot-backend -- ws_client --nocapture` เพื่อทดสอบต่อ Public WebSocket สตรีมราคาเหรียญ BTC-USDT จริงกลับมาได้สำเร็จ
 - การส่งคำสั่งในโมดูลถัดไป (Order Pipeline) จะสามารถขอ Permit จาก `OkxRateLimiter` เพื่อการันตีว่าจะไม่เกิด Error 50011 หรือ 50061
 
+---
+
+# [CHANGE_LOG] 2026-09-15 - Implement Bot Lifecycle Management (Skeleton) & Full OKX v5 WebSocket Suite
+
+## 1. META_DATA
+- **Feature/Issue:** Bot Lifecycle Management (CRUD + Start/Stop + Safety Guards) and Complete OKX v5 WebSocket Suite (3 Public Streams, 3 Private Streams, 5 Trading Operations)
+- **Target Component:** `domain/strategy.rs`, `domain/strategy/`, `domain/order.rs`, `storage/repositories/strategy_repository.rs`, `bot/manager.rs`, `bot/executor.rs`, `services/strategy_service.rs`, `web/handlers/bot_control.rs`, `web/routes.rs`, `okx/ws_client.rs`, `okx/ws_trade.rs`, `okx/dto/market.rs`, `okx/dto/trade.rs`, `main.rs`, `Cargo.toml`
+- **Action Type:** ADD | MODIFY
+
+## 2. MODIFIED_FILES
+- `Cargo.toml`: เพิ่ม dependencies `rust_decimal = { version = "1.36", features = ["serde-str"] }` และ `tokio-util = "0.7"` (สำหรับ `CancellationToken`)
+- `src/domain/strategy.rs`: 
+  - ออกแบบแยก `StrategyConfig` (Static Parameters) ออกจาก `StrategyState` (Runtime Active Orders)
+  - `StrategyStatus`: `Created`, `Running`, `Paused`, `Stopped`, `Error`
+  - DTOs: `CreateBotRequest`, `UpdateBotRequest`, `BotResponse` พร้อม `utoipa::ToSchema`
+- `src/domain/strategy/fixed_ratio_rebalance.rs`: เพิ่ม `ToSchema` ให้ `FixdRatioRebalanceConfig` พร้อม Swagger examples ชัดเจน
+- `src/domain/order.rs`: เพิ่ม `Side` และ `TrackedOrder` พร้อม derives และ Swagger schemas
+- `src/storage/repositories/strategy_repository.rs`: สร้าง Repository สำหรับ MongoDB collection `strategies` (Create, List, Get, Update Config/Status, Delete)
+- `src/bot/executor.rs`: สร้าง `BotExecutor` Background Task loop จัดการ Event stream และรองรับ `CancellationToken` (Graceful Shutdown)
+- `src/bot/manager.rs`: สร้าง `BotManager` In-Memory Controller บันทึก `CancellationToken` แยกรายบอท และควบคุม Start/Stop แบบ isolated
+- `src/services/strategy_service.rs`: สร้าง `StrategyService` พร้อม Safety Guards:
+  - ห้ามแก้ไขหรือลบบอทขณะที่กำลังทำงานอยู่ (`BotIsRunning`)
+  - ตรวจสอบความเป็นเจ้าของ Exchange Account ก่อนสร้างบอท
+- `src/web/handlers/bot_control.rs`: สร้าง REST API 7 endpoints สำหรับจัดการบอท
+- `src/web/routes.rs`: ลงทะเบียน `/api/bots` ภายใต้ Bearer Auth และบันทึก OpenAPI specs
+- `src/okx/dto/market.rs`: เพิ่ม `OkxTradeData` (Public trades) และ `OkxOrderBookData` (Order book depths)
+- `src/okx/dto/trade.rs`: เพิ่ม Private Streams (`OkxOrderUpdateData`, `OkxMyTradeData`, `OkxAccountBalanceUpdate`) และ 5 Trading Operations (`WsPlaceOrderArg`, `WsAmendOrderArg`, `WsCancelOrderArg`, `WsBatchCancelOrderArg`, `WsOrderResult`)
+- `src/okx/ws_client.rs`: อัปเกรด `OkxPublicWsClient` ให้รองรับทั้ง 3 Public Streams (`tickers`, `trades`, `books5`)
+- `src/okx/ws_trade.rs`: อัปเกรด `OkxWsTradeClient` ให้รองรับทั้ง 3 Private Streams และ 5 Trading Operations (Create Order, Batch Create, Edit Order, Cancel Order, Batch Cancel)
+- `src/main.rs`: เชื่อมต่อ `StrategyRepository`, `BotManager`, `OkxManager`, และ `StrategyService` เข้ากับ `AppState`
+
+## 3. CONTEXT_AND_REASON
+- **Problem/Requirement:**
+  1. ต้องการระบบจัดการวงจรชีวิตของบอทเทรด (Bot Lifecycle Management Skeleton) ที่รองรับ User Flow บน Web Dashboard: Create -> List -> Edit -> Delete -> Start -> Stop
+  2. ต้องมี Safety Guard ป้องกันการแก้พารามิเตอร์หรือลบบอทขณะที่กำลังรัน เพื่อไม่ให้เกิด Orphan Orders บน Exchange
+  3. จัดเตรียม WebSocket Infrastructure ให้ครอบคลุมตาม Architecture ของระบบเดิม (Public 3 streams, Private 3 streams, Trading 5 operations)
+- **Previous Behavior:** ระบบยังไม่มี Entity สำหรับบอท, ไม่มี API สำหรับควบคุม Start/Stop และ WebSocket ยังรองรับเฉพาะ Ticker
+
+## 4. IMPLEMENTATION_DETAILS
+- **[ADDED]:**
+  - Bot Lifecycle REST API:
+    - `POST /api/bots`: สร้างบอทใหม่
+    - `GET /api/bots`: ดึงรายการบอททั้งหมดของ User
+    - `GET /api/bots/{id}`: ดูข้อมูลบอทรายตัว
+    - `PUT /api/bots/{id}`: แก้ไขบอท (บล็อกเมื่อ Status เป็น Running)
+    - `DELETE /api/bots/{id}`: ลบบอท (บล็อกเมื่อ Status เป็น Running)
+    - `POST /api/bots/{id}/start`: สั่งรัน Background Task
+    - `POST /api/bots/{id}/stop`: สั่งหยุด Background Task
+  - Concurrency Runtime:
+    - `BotManager`: ถือ `Arc<RwLock<HashMap<String, CancellationToken>>>`
+    - `BotExecutor`: Tokio Task วิ่งคู่ขนานแบบแยกอิสระต่อบอท 1 ตัว (Fault Isolation)
+  - Full WebSocket Suite:
+    - Public: `subscribe_ticker`, `subscribe_trades`, `subscribe_orderbook`
+    - Private: `subscribe_orders`, `subscribe_my_trades`, `subscribe_balance`
+    - Trading Ops: `create_order_ws`, `create_orders_ws`, `edit_order_ws`, `cancel_order_ws`, `cancel_orders_ws`
+- **[MODIFIED]:**
+  - `src/domain/strategy.rs`: แยก `Config` ออกจาก `State` ชัดเจน
+  - `src/web/state.rs`: เพิ่ม `strategy_service` ใน `AppState`
+
+## 5. BREAKING_CHANGES_AND_SIDE_EFFECTS
+- **Breaking Changes:** NO
+- **Dependencies Added:**
+  - `rust_decimal = { version = "1.36", features = ["serde-str"] }`
+  - `tokio-util = "0.7"`
+
+## 6. EXPECTED_BEHAVIOR
+- `cargo check` ผ่านสมบูรณ์ (0 errors, 0 warnings)
+- ผู้ใช้สามารถเข้า Swagger UI ที่ `http://localhost:3000/swagger-ui` เลือก Tag `"Trading Bots"` เพื่อทดสอบสร้างบอท Fixed Ratio Rebalance, ดูรายการ, และสั่ง Start/Stop ได้ทันที
+- การกด Start จะจำลอง Background Loop ใน Memory และการกด Stop จะปิด Task อย่างสง่างามโดยไม่กระทบบอทตัวอื่น
+- มีช่องทาง WebSocket ให้พร้อมเชื่อมต่อกับ CEM และ Order Pipeline ใน Phase ถัดไป
+
+---
+
+# [CHANGE_LOG] 2026-09-15 - Migrate Logging to flexi_logger & Graceful Shutdown
+
+## 1. META_DATA
+- **Feature/Issue:** Replace `tracing` with `log` + `flexi_logger`, Standardize Bot Log Format, and Graceful Server Shutdown
+- **Target Component:** `observability/logging.rs`, `bot/executor.rs`, `okx/ws_client.rs`, `main.rs`
+- **Action Type:** ADD | MODIFY
+
+## 2. MODIFIED_FILES
+- `src/observability/logging.rs`: สร้างระบบ Logger กลาง (`setup_logger`, `flush_log`) ใช้ `flexi_logger` เขียน log ลงไฟล์ `logs/app_*.log` และแสดงผลใน terminal (stderr) พร้อมกัน
+- `src/observability/mod.rs`: expose โมดูล `logging`
+- `src/bot/executor.rs`: เปลี่ยนจาก `tracing::*` เป็น `log::*` ทุกจุด และปรับรูปแบบ log ให้ `[Bot #id]` อยู่หน้า emoji เสมอ
+- `src/okx/ws_client.rs`: เปลี่ยนจาก `tracing::*` เป็น `log::*` ทุกจุด (8 จุด)
+- `src/main.rs`: เพิ่ม `pub mod observability`, เรียก `setup_logger()` ก่อนทุกอย่าง, เปลี่ยน `println!` เป็น `log::info!`, เพิ่ม Graceful Shutdown ด้วย `tokio::signal::ctrl_c()`
+
+## 3. CONTEXT_AND_REASON
+- **Problem/Requirement:**
+  1. `tracing` macros เป็น no-op เพราะไม่ได้ตั้ง subscriber ใน `main.rs` ทำให้ไม่เห็น log ใน terminal เลย
+  2. ต้องการบันทึก log ลงไฟล์ (`logs/`) ควบคู่กับแสดงผลใน terminal ตามรูปแบบ `[timestamp] LEVEL [file:line] message`
+  3. ต้องการรูปแบบ Bot log ที่แยกตัวได้ชัดเจน: `[Bot #id]` ต้องอยู่หน้า emoji/status เสมอ
+  4. กด `Ctrl+C` แล้ว process exit code ไม่ใช่ 0 (`STATUS_CONTROL_C_EXIT`) ต้องการ graceful shutdown
+- **Previous Behavior:** Log จาก `tracing::info!` ไม่แสดงผลเลย, `println!` ไม่มี timestamp/level, กด Ctrl+C ได้ exit code ผิดปกติ
+
+## 4. IMPLEMENTATION_DETAILS
+- **[ADDED]:**
+  - `src/observability/logging.rs`:
+    - `setup_logger()`: ตั้งค่า `flexi_logger` อ่านระดับ log จาก `RUST_LOG` env (fallback เป็น `info`), เขียนลง `logs/app_*.log` + duplicate ไป stderr
+    - `flush_log()`: flush buffer ก่อนปิดโปรแกรม กันข้อมูลหาย
+    - `log_format()`: Custom format `[YYYY-MM-DD HH:MM:SS.mmm] LEVEL [file:line] message`
+  - `src/observability/mod.rs`: โมดูล entry point
+  - `shutdown_signal()` ใน `main.rs`: รอรับ `Ctrl+C` แล้ว trigger graceful shutdown ของ Axum server
+- **[MODIFIED]:**
+  - `src/bot/executor.rs`: `tracing::*` → `log::*` (7 จุด), ย้าย emoji ไว้หลัง `[Bot #id]`
+    - ก่อน: `🛑 [Bot #id] Stop requested...`
+    - หลัง: `[Bot #id] 🛑 Stop requested...`
+  - `src/okx/ws_client.rs`: `tracing::*` → `log::*` (8 จุด)
+  - `src/main.rs`: `println!` → `log::info!` (4 จุด), เพิ่ม `with_graceful_shutdown()`
+- **[DEPRECATED/REMOVED]:** ไม่มีการใช้ `tracing` macros อีกต่อไปในโค้ด (dependency ยังคงอยู่ใน Cargo.toml เนื่องจาก transitive deps ใช้)
+
+## 5. BREAKING_CHANGES_AND_SIDE_EFFECTS
+- **Breaking Changes:** NO
+- **Dependencies Added:**
+  - `log = "0.4"`
+  - `flexi_logger = "0.29"`
+
+## 6. EXPECTED_BEHAVIOR
+- เมื่อ `cargo run` จะเห็น log ใน terminal ในรูปแบบ:
+  ```
+  [2026-09-15 03:30:43.701] INFO [src\main.rs:34] Loading application configuration...
+  [2026-09-15 03:30:43.705] INFO [src\main.rs:46] MongoDB connected successfully!
+  ```
+- Log จะถูกบันทึกลงไฟล์ในโฟลเดอร์ `logs/` พร้อมกัน
+- Bot log จะแสดง `[Bot #bot-id]` นำหน้าเสมอ เช่น `[Bot #bot-8f2a1b] 🛑 Cancellation requested...`
+- กด `Ctrl+C` จะเห็น log `Ctrl+C received — initiating graceful shutdown...` แล้ว process จะ exit code 0 อย่างเรียบร้อย
 

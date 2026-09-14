@@ -4,8 +4,28 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsSubscriptionArg {
     pub channel: String,
-    #[serde(rename = "instId")]
-    pub inst_id: String,
+    #[serde(rename = "instId", skip_serializing_if = "Option::is_none")]
+    pub inst_id: Option<String>,
+    #[serde(rename = "instType", skip_serializing_if = "Option::is_none")]
+    pub inst_type: Option<String>,
+}
+
+impl WsSubscriptionArg {
+    pub fn per_instrument(channel: &str, inst_id: &str) -> Self {
+        Self {
+            channel: channel.to_string(),
+            inst_id: Some(inst_id.to_string()),
+            inst_type: None,
+        }
+    }
+
+    pub fn per_account(channel: &str) -> Self {
+        Self {
+            channel: channel.to_string(),
+            inst_id: None,
+            inst_type: None,
+        }
+    }
 }
 
 /// คำสั่ง Request ส่งเข้า OKX WebSocket (เช่น subscribe, unsubscribe, login)
@@ -24,38 +44,57 @@ pub struct WsEventResponse {
     pub conn_id: Option<String>,
 }
 
-/// ข้อมูล Ticker ราคาตลาดสดจาก OKX v5 Public Channel `tickers`
+/// 1. ข้อมูล Ticker ราคาตลาดสดจาก OKX v5 Public Channel `tickers`
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OkxTickerData {
     #[serde(rename = "instType")]
     pub inst_type: String,
     #[serde(rename = "instId")]
     pub inst_id: String,
-    /// ราคาล่าสุด (Last traded price)
     pub last: String,
-    /// ขนาดของไม้ล่าสุด
     #[serde(rename = "lastSz")]
     pub last_size: String,
-    /// ราคา Best Ask (ราคาเสนอขายที่ดีที่สุด)
     #[serde(rename = "askPx")]
     pub ask_price: String,
-    /// ปริมาณ Best Ask
     #[serde(rename = "askSz")]
     pub ask_size: String,
-    /// ราคา Best Bid (ราคาเสนอซื้อที่ดีที่สุด)
     #[serde(rename = "bidPx")]
     pub bid_price: String,
-    /// ปริมาณ Best Bid
     #[serde(rename = "bidSz")]
     pub bid_size: String,
-    /// ราคาสูงสุดรอบ 24 ชั่วโมง
     pub high24h: String,
-    /// ราคาต่ำสุดรอบ 24 ชั่วโมง
     pub low24h: String,
-    /// ปริมาณการซื้อขายรอบ 24 ชั่วโมง (base currency)
     pub vol24h: String,
-    /// เวลา Timestamp บนกระดาน OKX (Unix milliseconds)
     pub ts: String,
+}
+
+/// 2. ข้อมูล Public Trades ตลาดสดจาก OKX v5 Public Channel `trades`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OkxTradeData {
+    #[serde(rename = "instId")]
+    pub inst_id: String,
+    #[serde(rename = "tradeId")]
+    pub trade_id: String,
+    pub px: String,
+    pub sz: String,
+    pub side: String, // "buy" or "sell"
+    pub ts: String,
+}
+
+/// 3. ข้อมูล Order Book ความลึกกระดานจาก OKX v5 Public Channel `books5` / `books`
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OkxOrderBookData {
+    #[serde(rename = "instId", default)]
+    pub inst_id: String,
+    /// Bids: Array of [price, size, num_orders]
+    #[serde(default)]
+    pub bids: Vec<Vec<String>>,
+    /// Asks: Array of [price, size, num_orders]
+    #[serde(default)]
+    pub asks: Vec<Vec<String>>,
+    pub ts: String,
+    #[serde(default)]
+    pub checksum: Option<i64>,
 }
 
 /// Wrapper สำหรับ Data Message ที่ OKX สตรีมกลับมา

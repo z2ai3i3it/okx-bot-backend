@@ -1,1 +1,1 @@
-/// Module entry for domain models // ตัวนำเข้าโมดูลโมเดลข้อมูลกลาง
+//! Module entry for strategy mode

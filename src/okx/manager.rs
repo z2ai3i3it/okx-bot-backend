@@ -14,7 +14,7 @@ pub struct OkxManager {
 
 impl OkxManager {
     pub fn new() -> Self {
-        let (public_ws, _rx) = OkxPublicWsClient::new();
+        let public_ws = OkxPublicWsClient::new();
         Self {
             public_ws,
             rate_limiters: Arc::new(RwLock::new(HashMap::new())),

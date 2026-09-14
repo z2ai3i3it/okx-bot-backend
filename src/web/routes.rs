@@ -11,6 +11,11 @@ use utoipa_swagger_ui::SwaggerUi;
 
 use crate::domain::{
     account::{AccountResponse, AccountStatus, LinkAccountRequest},
+    order::{Side, TrackedOrder},
+    strategy::{
+        fixed_ratio_rebalance::FixdRatioRebalanceConfig, grid::GridConfig, BotResponse,
+        CreateBotRequest, StrategyConfig, StrategyState, StrategyStatus, UpdateBotRequest,
+    },
     user::{
         AuthResponse, ChangePasswordRequest, GenericMessageResponse, LoginRequest, RegisterRequest,
         Role, UpdateProfileRequest, UserResponse, UserStatus,
@@ -26,6 +31,10 @@ use crate::web::{
         auth::{
             self as auth_handlers, change_password, delete_account, get_current_user, login,
             logout, register, update_profile,
+        },
+        bot_control::{
+            self as bot_handlers, create_bot, delete_bot, get_bot, list_bots, start_bot,
+            stop_bot, update_bot,
         },
     },
     middlewares::auth_middleware::require_auth,
@@ -68,6 +77,13 @@ impl Modify for SecurityAddon {
         account::get_account,
         account::delete_account,
         account::verify_account,
+        bot_handlers::create_bot,
+        bot_handlers::list_bots,
+        bot_handlers::get_bot,
+        bot_handlers::update_bot,
+        bot_handlers::delete_bot,
+        bot_handlers::start_bot,
+        bot_handlers::stop_bot,
     ),
     components(
         schemas(
@@ -85,12 +101,23 @@ impl Modify for SecurityAddon {
             AccountResponse,
             AccountVerificationResult,
             OkxBalanceDetail,
+            CreateBotRequest,
+            UpdateBotRequest,
+            BotResponse,
+            StrategyConfig,
+            StrategyState,
+            StrategyStatus,
+            FixdRatioRebalanceConfig,
+            GridConfig,
+            TrackedOrder,
+            Side,
         )
     ),
     modifiers(&SecurityAddon),
     tags(
         (name = "Authentication", description = "OKX Web Bot User Authentication & Profile Management Endpoints"),
-        (name = "Exchange Accounts", description = "OKX API Key Linking & Encrypted Account Management Endpoints")
+        (name = "Exchange Accounts", description = "OKX API Key Linking & Encrypted Account Management Endpoints"),
+        (name = "Trading Bots", description = "Trading Bot Lifecycle & Strategy Configuration Endpoints")
     ),
     info(
         title = "OKX Web Bot API",
@@ -123,6 +150,14 @@ pub fn create_router(state: AppState) -> Router {
         .route("/{id}/verify", post(verify_account))
         .route_layer(from_fn_with_state(state.clone(), require_auth));
 
+    // Protected Trading Bot Routes ต้องมี Token
+    let bot_routes = Router::new()
+        .route("/", post(create_bot).get(list_bots))
+        .route("/{id}", get(get_bot).put(update_bot).delete(delete_bot))
+        .route("/{id}/start", post(start_bot))
+        .route("/{id}/stop", post(stop_bot))
+        .route_layer(from_fn_with_state(state.clone(), require_auth));
+
     // ผูก Swagger UI เข้ากับ Axum Router
     let swagger_router = SwaggerUi::new("/swagger-ui")
         .url("/api-docs/openapi.json", ApiDoc::openapi());
@@ -131,5 +166,6 @@ pub fn create_router(state: AppState) -> Router {
         .merge(swagger_router)
         .nest("/api/auth", auth_public_routes.merge(auth_protected_routes))
         .nest("/api/accounts", account_routes)
+        .nest("/api/bots", bot_routes)
         .with_state(state)
 }

@@ -28,6 +28,10 @@ hmac = "0.12"
 sha2 = "0.10"
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 tracing = "0.1"
+rust_decimal = { version = "1.36", features = ["serde-str"] }
+tokio-util = "0.7"
+log = "0.4"
+flexi_logger = "0.29"
 
 
 

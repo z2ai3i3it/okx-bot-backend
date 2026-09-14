@@ -1,10 +1,10 @@
 # okx-bot-backend
 
-## 🔐 Core Modules: Authentication, OKX Linking & Pure OKX v5 Connector
+## 🔐 Core Modules: Auth, OKX Linking, Pure Connector & Bot Lifecycle
 
-> **Branches:** `feat-auth`, `feat/okx-account-linking`, `feat/okx-signer-rest`, `feat/okx-v5-ws-ratelimit`
-> **Status:** ✅ เสร็จสมบูรณ์ (Auth + OKX Linking + Signer + REST + WebSocket + Hierarchical Rate Limiter)
-> **วันที่อัปเดต:** 2026-09-10
+> **Branches:** `feat-auth`, `feat/okx-account-linking`, `feat/okx-signer-rest`, `feat/okx-v5-ws-ratelimit`, `feat/bot-engine`
+> **Status:** ✅ เสร็จสมบูรณ์ (Auth + OKX Linking + Signer + REST + WebSocket Suite + Bot Lifecycle Skeleton)
+> **วันที่อัปเดต:** 2026-09-15
 
 ### 📋 สิ่งที่ทำเสร็จแล้ว (Completed Modules)
 
@@ -28,14 +28,26 @@
 | **Account Handlers** | `POST /api/accounts`, `GET /api/accounts`, `GET /api/accounts/:id`, `DELETE /api/accounts/:id`, `POST /api/accounts/:id/verify` | `src/web/handlers/account.rs` |
 | **OpenAPI / Swagger UI** | Swagger UI (`/swagger-ui`) รองรับ Bearer Auth และ Schema ของทั้ง Auth & Exchange Accounts | `src/web/routes.rs` |
 
-#### 3. Pure OKX v5 Connector & Rate Limiter (Exchange Layer)
+#### 3. Pure OKX v5 Connector & Full WebSocket Suite (Exchange Layer)
 | Feature | รายละเอียด | ไฟล์หลัก |
 |---------|-----------|----------|
 | **OKX v5 Signer** | HMAC-SHA256 Base64 Signer สำหรับ Auth Headers และ WS Login ตามมาตรฐาน OKX v5 | `src/okx/signer.rs` |
 | **REST Balance Client** | ตรวจสอบยอดเงินจริงและทดสอบความถูกต้องของ Key ผ่าน `GET /api/v5/account/balance` | `src/okx/rest_client.rs` |
 | **Hierarchical Rate Limiter** | Multi-level Token Bucket: Sub-account (1,000 req/2s) ป้องกัน 50061, Instrument Single (60/2s), Batch (300/2s) ป้องกัน 50011 | `src/okx/rate_limiter.rs` |
-| **Public WebSocket Client** | Singleton Hub สตรีมราคาตลาดสด (Tickers, BBO) พร้อม Heartbeat Ping/Pong 20s และ Reconnect Backoff | `src/okx/ws_client.rs` |
-| **WS Trade & Connection Pool** | Dispatcher คำสั่งซื้อขายความเร็วสูงผ่าน WS พร้อม `OkxManager` จัดการ Pool แยกตาม Sub-account | `src/okx/ws_trade.rs`, `src/okx/manager.rs` |
+| **Public WebSocket (3 Streams)** | Ticker, Public Trades, และ Order Book (Books5/Books) พร้อม Heartbeat Ping/Pong 20s และ Reconnect Backoff | `src/okx/ws_client.rs` |
+| **Private WebSocket (3 Streams)** | Orders Update, My Trades (Fills), และ Balance Update สดผ่าน Private WS | `src/okx/ws_trade.rs` |
+| **WS Trading Ops (5 Operations)**| Single Order, Batch Orders (20 ไม้), Edit Order, Cancel Order, Batch Cancel Orders ผ่าน WS | `src/okx/ws_trade.rs` |
+| **Connection Pool** | `OkxManager` บริหารจัดการ WS กลาง และ Map RateLimiter แยกราย Sub-account | `src/okx/manager.rs` |
+
+#### 4. ระบบจัดการบอทเทรด (Trading Bot Lifecycle Skeleton)
+| Feature | รายละเอียด | ไฟล์หลัก |
+|---------|-----------|----------|
+| **Domain Models & Separation** | แยก `StrategyConfig` (Static) ออกจาก `StrategyState` (Runtime Active Orders) อย่างชัดเจน | `src/domain/strategy.rs` |
+| **Fixed Ratio Rebalance Schema** | นิยาม `FixdRatioRebalanceConfig` พร้อมตัวอย่าง Swagger ค่าจริง (`initial_capital`, `ratios`, `precision`) | `src/domain/strategy/fixed_ratio_rebalance.rs` |
+| **Strategy Persistence** | `StrategyRepository` สำหรับ MongoDB collection `strategies` (CRUD + Status updates) | `src/storage/repositories/strategy_repository.rs` |
+| **Concurrency Task Controller** | `BotManager` ถือ `CancellationToken` แยกรายบอท และคุม `BotExecutor` รันอิสระแบบ Fault Isolation | `src/bot/manager.rs`, `src/bot/executor.rs` |
+| **Safety Guards & Service** | `StrategyService` บล็อกการแก้ไขหรือลบบอทที่กำลัง Running ป้องกัน Orphan Orders | `src/services/strategy_service.rs` |
+| **Bot Control REST API** | Create, List, Get, Update, Delete, Start, Stop ภายใต้ `/api/bots` | `src/web/handlers/bot_control.rs` |
 
 ---
 
@@ -52,6 +64,8 @@
 | Token | jsonwebtoken | 9.3 | HMAC-SHA256 Stateless JWT |
 | Stream Utility | futures-util | 0.3 | MongoDB Cursor Stream processing |
 | Serialization | serde + serde_json | 1.0 | Data serialization & JSON |
+| Numeric Precision | rust_decimal | 1.36 (serde-str) | High-precision decimal arithmetic without floating-point error |
+| Concurrency Control | tokio-util | 0.7 | Structured CancellationToken for graceful shutdown |
 | Date/Time | chrono | 0.4 | UTC timestamp tracking |
 | UUID | uuid v4 | 1.10 | Unique ID generation |
 | API Documentation | utoipa + utoipa-swagger-ui | 5 / 9 | OpenAPI 3.0 Interactive Docs |
@@ -81,7 +95,18 @@
 | `DELETE` | `/api/accounts/{id}` | Bearer | ยกเลิกการผูกบัญชี OKX |
 | `POST` | `/api/accounts/{id}/verify` | Bearer | ตรวจสอบสุขภาพ Key และทดสอบดึง Asset Balance จาก OKX v5 จริง |
 
-#### 3. Documentation & Testing
+#### 3. Trading Bots (`/api/bots`)
+| Method | Path | Auth | Description |
+|--------|------|:----:|-------------|
+| `POST` | `/api/bots` | Bearer | สร้างบอทเทรดใหม่ (Fixed Ratio Rebalance) |
+| `GET` | `/api/bots` | Bearer | ดูรายการบอททั้งหมดของฉัน |
+| `GET` | `/api/bots/{id}` | Bearer | ดูรายละเอียดและการตั้งค่าของบอท |
+| `PUT` | `/api/bots/{id}` | Bearer | แก้ไขพารามิเตอร์ของบอท (เฉพาะเมื่อไม่ได้รันอยู่) |
+| `DELETE` | `/api/bots/{id}` | Bearer | ลบบอท (เฉพาะเมื่อไม่ได้รันอยู่) |
+| `POST` | `/api/bots/{id}/start` | Bearer | สั่งเริ่มรันบอท (Spawn Background Task) |
+| `POST` | `/api/bots/{id}/stop` | Bearer | สั่งหยุดบอท (Graceful Shutdown ด้วย CancellationToken) |
+
+#### 4. Documentation & Testing
 | Path | Description |
 |------|-------------|
 | `/swagger-ui` | Swagger UI Interactive API Documentation |
