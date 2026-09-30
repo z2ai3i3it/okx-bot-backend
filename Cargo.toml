@@ -29,6 +29,7 @@ sha2 = "0.10"
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 tracing = "0.1"
 rust_decimal = { version = "1.36", features = ["serde-str"] }
+rust_decimal_macros = "1.36"
 tokio-util = "0.7"
 log = "0.4"
 flexi_logger = "0.29"

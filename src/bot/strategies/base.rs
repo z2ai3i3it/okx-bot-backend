@@ -37,4 +37,15 @@ pub trait Strategy: Send + Sync {
     /// รับข้อมูล Trade Fill จาก Private WebSocket (`my-trades` / `fills` channel)
     /// แจ้งเตือนเมื่อเกิดการจับคู่ซื้อขายจริง
     fn on_fill_update(&mut self, fill: &OkxMyTradeData) -> Vec<StrategyAction>;
+
+    /// Hook สำหรับกู้คืน State (Recovery Reconcile) เมื่อ Bot Start/Restart
+    /// รับรายการ Trades ที่ตกค้างหรือเกิดขึ้นระหว่างที่บอทออฟไลน์ เพื่อ Replay State ให้เป็นปัจจุบัน
+    fn on_recovery_reconcile(&mut self, _missed_trades: &[OkxMyTradeData]) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// ดึง Rebalance Snapshot ล่าสุด (ถ้ามี) เพื่อนำไป persist ลง database
+    fn get_latest_snapshot(&self) -> Option<crate::bot::math::fixed_ratio_cal::RebalanceRecord> {
+        None
+    }
 }

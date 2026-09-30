@@ -14,25 +14,22 @@ use crate::{
 /// 1. รับ Ticker แรกเข้ามา
 /// 2. วางคู่ Order (Buy / Sell) โดยคำนวณราคาห่างจาก Bid/Ask +/- 5000 tick (หรือ point offset)
 /// 3. พิมพ์ log ระบุ Original Bid/Ask ชัดเจน เพื่อยืนยันว่าราคาตลาดสดมาถึงจริง
-pub struct FixedRatioStrategy {
+pub struct GridStrategy {
     pub bot_id: String,
     pub pair: String,
     pub order_size: String,
     pub tick_offset: Decimal,
-    /// สถานะว่าเคยวาง Order คู่ทดสอบไปแล้วหรือยัง (วางแค่ 1 คู่)
     pub has_placed_initial_orders: bool,
-    /// เก็บ clOrdId ของ Order ที่วางเพื่อใช้ติดตาม
     pub active_buy_cl_ord_id: Option<String>,
     pub active_sell_cl_ord_id: Option<String>,
 }
 
-impl FixedRatioStrategy {
+impl GridStrategy {
     pub fn new(bot_id: String, pair: String, order_size: String) -> Self {
         Self {
             bot_id,
             pair,
             order_size,
-            // 5000 tick offset (สำหรับคู่เช่น BTC-USDT 1 tick = 0.1 หรือ 1.0 ตาม config)
             tick_offset: Decimal::from(5000),
             has_placed_initial_orders: false,
             active_buy_cl_ord_id: None,
@@ -46,7 +43,7 @@ impl FixedRatioStrategy {
     }
 }
 
-impl Strategy for FixedRatioStrategy {
+impl Strategy for GridStrategy {
     fn on_ticker(&mut self, ticker: &OkxTickerData) -> Vec<StrategyAction> {
         // กรองเฉพาะ pair ของตัวเอง
         if ticker.inst_id != self.pair {

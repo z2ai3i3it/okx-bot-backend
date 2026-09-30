@@ -7,7 +7,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-
 /// เทียบเท่า 1e-10 ใน python (guard กัน division by ~0)
 fn epsilon_guard() -> Decimal {
     Decimal::from_str("0.0000000001").unwrap()
@@ -18,7 +17,7 @@ fn epsilon_tiny() -> Decimal {
     Decimal::from_str("0.0000000000000001").unwrap()
 }
 
-use crate::bots_config::Side;
+use crate::domain::order::Side;
 
 /// python: rounddown()
 /// พฤติกรรมจริงของโค้ดเดิม = ปัดเข้าใกล้ 0 (truncate towards zero) เป็นทวีคูณของ decimal_factor
@@ -100,6 +99,19 @@ fn threshold_action(
     quote_additional_q: Decimal,
     base_value_ratio_target: Decimal,
 ) -> Decimal {
+    log::info!(
+        "threshold_action: side={:?}, filled_price_qb={}, base_balance_b={}, quote_value_q={}, base_additional_b={}, buy_threshold_ratio_target={}, sell_threshold_ratio_target={}, quote_additional_q={}, base_value_ratio_target={}",
+        side,
+        filled_price_qb,
+        base_balance_b,
+        quote_value_q,
+        base_additional_b,
+        buy_threshold_ratio_target,
+        sell_threshold_ratio_target,
+        quote_additional_q,
+        base_value_ratio_target,
+    );
+
     let threshold_toggle = match side {
         Side::Buy => base_value_ratio_target - buy_threshold_ratio_target,
         Side::Sell => base_value_ratio_target + sell_threshold_ratio_target,
@@ -279,49 +291,50 @@ pub(crate) fn generate_cl_ord_id() -> String {
 
 /// ค่า jitter factor สุ่ม 0.5–1.0 — ใช้กระจายเวลารอ (back off) ให้แต่ละ bot ไม่รัวพร้อมกัน
 /// (กัน thundering herd ตอน network กลับมา) — สุ่มจาก UUID v4 (OS RNG)
+#[allow(dead_code)]
 pub(crate) fn jitter_factor() -> f64 {
     let r = (uuid::Uuid::new_v4().as_u128() % 500 + 500) as f64 / 1000.0;
     r
 }
 
-// #[derive(Debug, Clone, Serialize, Deserialize)]
-// pub struct TargetAnchorOrder {
-//     pub side: Side,
-//     pub price_qb: Decimal,
-//     pub amount_b: Decimal,
-// }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetAnchorOrder {
+    pub side: Side,
+    pub price_qb: Decimal,
+    pub amount_b: Decimal,
+}
 
-// /// record เดียวกับที่ python คืนเป็น dict แล้วเอาไป insert DB
-// /// ที่นี่คือ record ที่จะถูก append ลง /logs/{bot_name}.json (ไฟล์แยกตาม bot)
-// #[derive(Debug, Clone, Serialize, Deserialize)]
-// pub struct RebalanceRecord {
-//     #[serde(rename = "_id")]
-//     pub id: String,
-//     #[serde(rename = "clOrdId")]
-//     pub cl_ord_id: String,
-//     pub sequence: u64,
-//     pub symbol: String,
-//     #[serde(rename = "type")]
-//     pub order_type: String,
-//     pub side: String,
-//     pub fee_type: String,
-//     pub target_anchor_buy: Option<TargetAnchorOrder>,
-//     pub target_anchor_sell: Option<TargetAnchorOrder>,
-//     pub price_qb: Decimal,
-//     pub base_balance_before_b: Decimal,
-//     pub base_value_before_q: Decimal,
-//     pub quote_value_before_q: Decimal,
-//     pub port_value_before_q: Decimal,
-//     pub got_b: Decimal,
-//     pub net_base_balance_b: Decimal,
-//     pub base_value_after_q: Decimal,
-//     pub quote_value_after_q: Decimal,
-//     pub port_value_after_q: Decimal,
-//     pub base_additional_b: Decimal,
-//     pub quote_additional_q: Decimal,
-//     #[serde(rename = "createdAt")]
-//     pub created_at: String,
-// }
+/// record เดียวกับที่ python คืนเป็น dict แล้วเอาไป insert DB
+/// ที่นี่คือ record ที่จะถูก append ลง /logs/{bot_name}.json (ไฟล์แยกตาม bot)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RebalanceRecord {
+    #[serde(rename = "_id")]
+    pub id: String,
+    #[serde(rename = "clOrdId")]
+    pub cl_ord_id: String,
+    pub sequence: u64,
+    pub symbol: String,
+    #[serde(rename = "type")]
+    pub order_type: String,
+    pub side: String,
+    pub fee_type: String,
+    pub target_anchor_buy: Option<TargetAnchorOrder>,
+    pub target_anchor_sell: Option<TargetAnchorOrder>,
+    pub price_qb: Decimal,
+    pub base_balance_before_b: Decimal,
+    pub base_value_before_q: Decimal,
+    pub quote_value_before_q: Decimal,
+    pub port_value_before_q: Decimal,
+    pub got_b: Decimal,
+    pub net_base_balance_b: Decimal,
+    pub base_value_after_q: Decimal,
+    pub quote_value_after_q: Decimal,
+    pub port_value_after_q: Decimal,
+    pub base_additional_b: Decimal,
+    pub quote_additional_q: Decimal,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+}
 
 /// python: save_to_db_first_filled_rebalance()
 /// ใช้ตอน rebalance ครั้งแรกสุด (ยังไม่มี snapshot ก่อนหน้า)

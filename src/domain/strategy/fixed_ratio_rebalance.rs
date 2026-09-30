@@ -11,9 +11,11 @@ pub struct FixdRatioRebalanceConfig {
     pub initial_capital_q: Decimal,
     #[schema(value_type = String, example = "0.5")]
     pub base_value_ratio_target: Decimal,
-    #[schema(value_type = String, example = "0.52")]
+    /// price change % threshold สำหรับ trigger การขาย (เช่น 0.02 = ราคาขึ้น 2% จึง rebalance)
+    #[schema(value_type = String, example = "0.02")]
     pub sell_threshold_ratio_target: Decimal,
-    #[schema(value_type = String, example = "0.48")]
+    /// price change % threshold สำหรับ trigger การซื้อ (เช่น 0.02 = ราคาตก 2% จึง rebalance)
+    #[schema(value_type = String, example = "0.02")]
     pub buy_threshold_ratio_target: Decimal,
     #[schema(value_type = String, example = "0.0008")]
     pub maker_fee: Decimal,

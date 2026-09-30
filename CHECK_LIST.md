@@ -80,9 +80,137 @@
 
 ---
 
-## Phase 5: Verification & End-to-End Test
+## Phase 5: Verification & End-to-End Test (Mock Pipeline)
 - [x] **5.1 ตรวจสอบการคอมไพล์และเทสต์ (`cargo test` - 14 passed)**
 - [x] **5.2 ยืนยันการไม่ flood log จาก Ticker (Snap แสดงผลเฉพาะตอนวาง Order เท่านั้น)**
   - [x] Ticker stream ทำงานเงียบใน background ไม่พิมพ์ log ทุก tick
   - [x] Snap log แสดงผลเฉพาะจังหวะ Place Order พร้อมแสดง Original Bid/Ask ครบถ้วน
   - [x] วางคำสั่งคู่ Buy/Sell (+/- 5000 tick) สำเร็จเข้าสู่ Pipeline Chain (Dedup -> CEM -> RateLimit -> OKX Executor)
+
+---
+
+## Phase 6: Fixed Ratio Strategy Implementation (`src/bot/strategies/fixed_ratio.rs`)
+ถอดบทเรียนและหลอมรวม logic จาก Python (`logs/fixed_ratio.py` - WS/Event-driven/Trade-Centric) และ Rust draft (`logs/fixed_ratio_strategy.rs` - REST/Downgraded) ให้กลายเป็นสถาปัตยกรรม Event-driven บน WebSocket Private + Public เต็มรูปแบบ
+
+- [x] **6.1 Data Structures & Strategy State Management**
+  - [x] รับและเก็บ `FixdRatioRebalanceConfig` จาก `StrategyModel`
+  - [x] ออกแบบ State ภายใน `FixedRatioStrategy`:
+    - `last_snapshot`: Snapshot สถานะ Rebalance ล่าสุด (Net Base Balance, Quote Value, Target Anchors, Sequence)
+    - `tracked_buy` / `tracked_sell`: ออเดอร์ที่กำลังเปิดอยู่ (`clOrdId`, `price`, `amount`, `side`, `status`)
+    - `cumulative_filled`: สะสม fill size ต่อ clOrdId ป้องกัน race condition ระหว่าง order closed กับ fill events
+    - `last_trade_waiters`: ตัวดักรอ trade fill ครบก่อนสั่ง cleanup / start new rebalance
+  - [x] ผูกคณิตศาสตร์การคำนวณจาก `src/bot/math/fixed_ratio_cal.rs`:
+    - `cal_target_price()`
+    - `cal_target_amount_improved()`
+    - `save_to_db_first_filled_rebalance()`
+    - `save_to_db_filled_rebalance()`
+
+- [x] **6.2 Phase แรก: First Order Flow (`rebalance_first`)**
+  - [x] เมื่อ Ticker แรกเข้ามา และยังไม่มี Snapshot:
+    - คำนวณ Portfolio Balance เริ่มต้น (`base_value` vs `quote_value`)
+    - หา `order_side` (Buy ถ้าถือ quote มากกว่า, Sell ถ้าถือ base มากกว่า)
+    - คำนวณ `amount_improved`
+  - [x] จัดการกรณี Balanced ตั้งแต่ต้น (`amount == 0` หรือ `< min_size_b`):
+    - สร้าง Seed Snapshot ทันที
+    - Trigger เข้าสู่ `rebalance_cal` เพื่อวาง Order คู่ Buy & Sell
+  - [x] จัดการกรณี Imbalanced:
+    - วาง Order เดี่ยว 1 ฝั่งแบบ `post_only` ด้วยราคาห่างตลาด (Adjusted Price)
+    - บันทึกสถานะเพื่อรอรับ Fill แล้วค่อยทำ Rebalance รอบถัดไป
+
+- [x] **6.3 Normal Cycle: Rebalance Calculation (`rebalance_cal`)**
+  - [x] ตรวจสอบ Balance Availability (`base > 0` และ `quote > 0`)
+  - [x] คำนวณราคาและขนาดเป้าหมายพร้อมกันทั้ง 2 ฝั่ง (`new_buy_price`, `new_sell_price`, `amount_buy`, `amount_sell`)
+  - [x] กำหนด Target Anchor Order สำหรับฝั่ง Buy และ Sell
+  - [x] สร้างและส่ง `StrategyAction::PlaceOrder` (Post-Only) ทั้ง 2 ฝั่งเข้า Order Pipeline
+
+- [x] **6.4 Real-time Event Handling (Order Update & Trade/Fill Events)**
+  - [x] **`on_order_update(&mut self, order: &OkxOrderUpdateData)`**:
+    - **Filled**: สั่ง Cancel Sibling ทันที (มีได้แค่ 1 ฝั่งที่ fill)
+    - **Safety Gate Waiter**: เช็คว่า Trades ครบตาม `filled` หรือยัง หากยังไม่ครบ ให้เข้า Waiter รอ
+    - **Canceled / Rejected**: ตรวจสอบว่าเป็น Planned (Sibling Cancel) หรือ Unplanned (โดนยกเลิกผิดปกติ)
+    - **Self-Healing**: หากเป็น Unplanned Cancel ให้เยียวยาด้วยการวางคำสั่งใหม่ที่ราคาตลาด
+  - [x] **`on_fill_update(&mut self, fill: &OkxMyTradeData)` (Trade-Centric)**:
+    - ตรวจสอบ Deduplication trade ID
+    - สะสม `cumulative_filled`
+    - คำนวณ Fee (Maker vs Taker)
+    - อัปเดต Snapshot Rebalance ทันที (`save_to_db_filled_rebalance`)
+    - ตรวจสอบ Waiter: หาก Trade ครบแล้ว ให้ Finalize Order และเคลียร์ Memory
+  - [x] **Finalize Order**:
+    - ล้าง tracked orders
+    - เมื่อออเดอร์ทั้งหมดถูกเคลียร์ (Clean Slate) $\rightarrow$ Trigger `rebalance_cal()` รอบถัดไปอัตโนมัติ
+
+- [x] **6.5 Integration & Edge Case Handling**
+  - [x] เชื่อม `FixdRatioRebalanceConfig` จาก DB/Strategy Model ใน `BotExecutor::new`
+  - [x] รองรับ Graceful Shutdown: สั่ง Cancel ออเดอร์ที่ค้างอยู่ทั้งหมดเมื่อบอทหยุดทำงาน
+  - [x] Verification & Testing: Unit tests สำหรับ state transitions (ผ่านครบ 21/21 tests)
+
+---
+
+## 📌 สถานะปัจจุบัน: สิ่งที่ยังไม่ได้นำมา (Pending / Missing Features)
+
+1. **Database Persistence (บันทึก Snapshot จริงลง Database)**
+   - ปัจจุบัน `snapshot` ยังคงอยู่ใน In-Memory (`Option<RebalanceRecord>`) เท่านั้น
+   - หากโปรเซสบอทดับหรือรีสตาร์ท ค่า sequence, net base balance และ quote value จะหายไป
+   - ยังไม่มี `RebalanceRepository` สำหรับ collection `rebalance_records` ใน MongoDB
+
+2. **Recovery Manager (`one_time_execute`)**
+   - ยังไม่มีขั้นตอนตรวจสอบ State เดิมก่อนเข้า Event Loop
+   - เมื่อบอทสตาร์ทใหม่ ยังไม่ได้ดึง Snapshot ล่าสุดจาก DB
+   - ยังไม่ได้ตรวจสอบและ Replay Trades ที่เกิดขึ้นระหว่างที่บอทปิดไป (Replay Fills)
+   - ยังไม่ได้สั่ง Clean Slate Cancel ออเดอร์ที่ค้างบน Exchange ก่อนเริ่มรอบใหม่
+
+3. **Chasing Market Price (Optional Feature ใน Python)**
+   - ฟีเจอร์ไล่ราคาตลาดตาม Spread / Depth ใน `logs/fixed_ratio.py` ยังไม่ได้นำมาใส่
+
+---
+
+## Phase 7: Database Persistence & Fault-Tolerant Generic Recovery
+
+### 🧠 สถาปัตยกรรม Recovery: Generic vs Strategy-Specific (ป้องกัน Rebalance Bias)
+เพื่อไม่ให้ `src/bot/recovery.rs` ผูกติด (Bias) กับ Rebalance กลยุทธ์เดียว และสามารถรองรับกลยุทธ์อื่นๆ เช่น Grid ได้อย่างไร้รอยต่อ จึงแบ่งขอบเขตหน้าที่อย่างชัดเจน:
+1. **Generic Recovery Engine (`src/bot/recovery.rs`)**:
+   - ทำงานเฉพาะระดับ **Exchange & Order Level** (ไม่แตะต้องสูตรคำนวณพอร์ต)
+   - **Clean Slate**: สั่ง Cancel คำสั่งที่ค้างอยู่บน OKX ทั้งหมดของบอทตัวนี้
+   - **Fetch Missed Trades**: ตรวจสอบคำสั่งค้างและดึงประวัติ Trade Fills ที่เกิดขึ้นระหว่างบอทออฟไลน์ (ผ่าน REST API)
+   - **Delegate**: ส่งรายการ Trades ทั้งหมดที่รวบรวมได้ มอบหมายให้ `Strategy::on_recovery_reconcile(&missed_trades)` เป็นคนจัดการต่อตามตรรกะของตนเอง
+2. **Strategy-Specific Replay (`src/bot/strategies/fixed_ratio.rs` & `base.rs`)**:
+   - เพิ่ม Hook `on_recovery_reconcile` ใน Trait `Strategy` (Default implementation ว่างเปล่า)
+   - `FixedRatioStrategy`: รับ Missed Trades $\rightarrow$ นำมา Replay คำนวณ Rebalance Snapshot ต่อเนื่อง (`save_to_db_filled_rebalance`) $\rightarrow$ Restore State พอร์ตให้พร้อมเริ่มรอบใหม่
+   - `GridStrategy` (ในอนาคต): รับ Missed Trades $\rightarrow$ ตรวจจับว่าไม้ไหน Fill เพื่อเตรียม Re-grid
+3. **Dedicated Rebalance Persistence (`src/storage/` & `src/services/`)**:
+   - แยก `RebalanceRepository` และ `RebalanceService` ออกมาเฉพาะสำหรับงานบันทึก Rebalance History โดยตรง ไม่ปนกับ Core Engine
+
+---
+
+### 📋 แผนงานพัฒนา Phase 7:
+
+- [x] **7.1 Layer 11 Persistence: `RebalanceRepository` (`src/storage/repositories/rebalance_repository.rs`)**
+  - [x] ออกแบบ Document Schema สำหรับ collection `rebalance_records` (มี `bot_id`, `sequence`, `price_qb`, `net_base_balance_b`, ฯลฯ)
+  - [x] Method `insert_record(&self, record: &Rebalance) -> MongoResult<()>`
+  - [x] Method `get_last_record(&self, bot_id: &str) -> MongoResult<Option<Rebalance>>`
+  - [x] Method `count_by_bot(&self, bot_id: &str) -> MongoResult<u64>`
+
+- [x] **7.2 Layer 9 Service: `RebalanceService` (`src/services/rebalance_service.rs`)**
+  - [x] ทำหน้าที่เป็น Application Service สำหรับ Rebalance Lifecycle
+  - [x] Method `save_trade_fill(&self, bot_id: &str, order_id: &str, record: &RebalanceRecord) -> Result<Rebalance, RebalanceServiceError>`
+  - [x] Method `get_last_snapshot(&self, bot_id: &str) -> Result<Option<RebalanceRecord>, RebalanceServiceError>`
+
+- [x] **7.3 Generic Recovery Engine (`src/bot/recovery.rs`)**
+  - [x] สร้าง Struct `RecoveryEngine` ที่เป็น Generic (ไม่ผูกกับ Rebalance)
+  - [x] Method `run_recovery(bot_id, inst_id, pending_client_order_ids, trade_client, missed_trades, strategy: &mut dyn Strategy) -> Result<(), RecoveryError>`:
+    - **Step 1: Clean Slate Cancel**: สั่ง Cancel คำสั่งที่ยังค้างอยู่บน OKX ทั้งหมดของบอทตัวนี้
+    - **Step 2: Fetch Missed Fills**: ตรวจสอบคำสั่งค้างและประวัติการ Match (Trades)
+    - **Step 3: Delegate to Strategy**: เรียก `strategy.on_recovery_reconcile(&missed_trades)` เพื่อให้กลยุทธ์ Replay ตัวเอง
+
+- [x] **7.4 Strategy Hook & Fixed Ratio Replay (`src/bot/strategies/base.rs` & `fixed_ratio.rs`)**
+  - [x] เพิ่ม `fn on_recovery_reconcile(&mut self, missed_trades: &[OkxMyTradeData]) -> Result<(), String>` ใน Trait `Strategy`
+  - [x] Implement ใน `FixedRatioStrategy`:
+    - นำ Trades ที่ได้มา Sort ตาม Timestamp (เก่า $\rightarrow$ ใหม่)
+    - Replay ทีละ Trade ผ่านสูตรคำนวณ `save_to_db_filled_rebalance`
+    - ตั้งค่า `self.snapshot` ล่าสุดให้พร้อมสำหรับการคำนวณ Rebalance รอบแรกทันทีที่เข้า Event Loop
+
+- [x] **7.5 Layer 7 Integration: เชื่อมต่อเข้ากับ `BotExecutor` (`src/bot/executor.rs`)**
+  - [x] ใน `BotExecutor::run()`:
+    - เรียก `RecoveryEngine::run_recovery()` ให้เรียบร้อยก่อนเปิดรับ WebSocket Event Loop
+    - เมื่อมี Event `on_fill_update` ใน Strategy $\rightarrow$ ส่ง Record บันทึกลง Database ผ่าน `RebalanceService` แบบ Non-blocking Async Task
+  - [x] Unit Test & Verification: ทดสอบ Recovery Flow จำลองทั้งกรณีไม่มีออเดอร์ค้าง และกรณีมี Missed Trades ตกค้าง
