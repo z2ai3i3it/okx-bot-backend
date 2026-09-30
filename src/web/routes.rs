@@ -162,10 +162,19 @@ pub fn create_router(state: AppState) -> Router {
     let swagger_router = SwaggerUi::new("/swagger-ui")
         .url("/api-docs/openapi.json", ApiDoc::openapi());
 
+    // ตั้งค่า CORS ให้อนุญาตการเรียกใช้จาก Web Client (Vue, React, หรือ Local Mockup HTML)
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any);
+
     Router::new()
+        .route("/health", get(|| async { "OK" }))
+        .route("/api/health", get(|| async { "OK" }))
         .merge(swagger_router)
         .nest("/api/auth", auth_public_routes.merge(auth_protected_routes))
         .nest("/api/accounts", account_routes)
         .nest("/api/bots", bot_routes)
+        .layer(cors)
         .with_state(state)
 }

@@ -4,6 +4,7 @@ pub mod crypto;
 pub mod domain;
 pub mod observability;
 pub mod okx;
+pub mod pipeline;
 pub mod services;
 pub mod storage;
 pub mod users;
@@ -69,6 +70,7 @@ async fn main() {
         account_repo,
         bot_manager,
         okx_manager,
+        encryption_service.clone(),
     );
 
     let auth_config = AuthConfig {

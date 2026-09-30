@@ -25,7 +25,7 @@ pub enum StrategyStatus {
 
 /// Static Configuration ของกลยุทธ์ (บันทึกลง Database ได้)
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type", content = "parameters")]
+#[serde(tag = "type", content = "parameters", rename_all = "snake_case")]
 pub enum StrategyConfig {
     FixedRatioRebalance(FixdRatioRebalanceConfig),
     Grid(GridConfig),
@@ -33,7 +33,7 @@ pub enum StrategyConfig {
 
 /// Dynamic Runtime State ของกลยุทธ์ใน Memory
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-#[serde(tag = "type", content = "state")]
+#[serde(tag = "type", content = "state", rename_all = "snake_case")]
 pub enum StrategyState {
     #[default]
     Idle,
@@ -149,6 +149,7 @@ pub struct CreateBotRequest {
     #[schema(example = "BTC-USDT")]
     pub pair: String,
     #[schema(example = true)]
+    #[serde(default)]
     pub sandbox: bool,
     pub config: StrategyConfig,
 }

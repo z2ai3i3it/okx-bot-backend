@@ -101,9 +101,12 @@ pub struct OkxBalanceDetailUpdate {
 /// 1. คำสั่งยิง Single Place Order ผ่าน WebSocket Trade API (`op: "order"`)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WsPlaceOrderArg {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(rename = "instId")]
     pub inst_id: String,
+    #[serde(rename = "instIdCode", skip_serializing_if = "Option::is_none")]
+    pub inst_id_code: Option<u64>,
     #[serde(rename = "tdMode")]
     pub td_mode: String, // "cash", "cross", "isolated"
     pub side: String,   // "buy", "sell"
@@ -123,6 +126,8 @@ pub struct WsPlaceOrderArg {
 pub struct WsAmendOrderArg {
     #[serde(rename = "instId")]
     pub inst_id: String,
+    #[serde(rename = "instIdCode", skip_serializing_if = "Option::is_none")]
+    pub inst_id_code: Option<u64>,
     #[serde(rename = "ordId", skip_serializing_if = "Option::is_none")]
     pub order_id: Option<String>,
     #[serde(rename = "clOrdId", skip_serializing_if = "Option::is_none")]
@@ -138,6 +143,8 @@ pub struct WsAmendOrderArg {
 pub struct WsCancelOrderArg {
     #[serde(rename = "instId")]
     pub inst_id: String,
+    #[serde(rename = "instIdCode", skip_serializing_if = "Option::is_none")]
+    pub inst_id_code: Option<u64>,
     #[serde(rename = "ordId", skip_serializing_if = "Option::is_none")]
     pub order_id: Option<String>,
     #[serde(rename = "clOrdId", skip_serializing_if = "Option::is_none")]

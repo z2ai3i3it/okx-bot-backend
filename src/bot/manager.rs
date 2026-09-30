@@ -44,6 +44,8 @@ impl BotManager {
         &self,
         strategy: Strategy,
         public_ws: OkxPublicWsClient,
+        trade_client: crate::okx::ws_trade::OkxWsTradeClient,
+        rate_limiter: Arc<crate::okx::rate_limiter::OkxRateLimiter>,
     ) -> Result<(), BotManagerError> {
         let bot_id = strategy.id.clone();
 
@@ -56,8 +58,18 @@ impl BotManager {
         guard.insert(bot_id.clone(), cancel_token.clone());
         drop(guard);
 
-        // สร้างและรัน Executor ใน Background Task
-        let executor = BotExecutor::new(strategy, public_ws, cancel_token);
+        // สร้าง Pipeline และ Executor
+        let pipeline = crate::pipeline::order_pipeline::OrderPipeline::new(
+            rate_limiter,
+            trade_client.clone(),
+        );
+        let executor = BotExecutor::new(
+            strategy,
+            public_ws,
+            trade_client,
+            pipeline,
+            cancel_token,
+        );
         let tokens_map = self.active_tokens.clone();
         let task_bot_id = bot_id.clone();
 

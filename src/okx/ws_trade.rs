@@ -55,15 +55,22 @@ pub struct OkxWsTradeClient {
 }
 
 impl OkxWsTradeClient {
-    /// สร้าง Trade Client เชื่อมต่อไปยัง Private WS
-    pub fn new() -> (Self, mpsc::Receiver<WsTradingOp>) {
+    /// สร้าง Trade Client
+    /// `is_simulated` = true → ใช้ OKX Demo Trading URL
+    pub fn new(is_simulated: bool) -> (Self, mpsc::Receiver<WsTradingOp>) {
         let (trading_op_tx, trading_op_rx) = mpsc::channel(1000);
         let (orders_sender, _) = broadcast::channel(1024);
         let (my_trades_sender, _) = broadcast::channel(1024);
         let (balance_sender, _) = broadcast::channel(512);
 
+        let ws_url = if is_simulated {
+            "wss://wspap.okx.com:8443/ws/v5/private?brokerId=9999".to_string()
+        } else {
+            "wss://ws.okx.com:8443/ws/v5/private".to_string()
+        };
+
         let client = Self {
-            ws_url: "wss://ws.okx.com:8443/ws/v5/private".to_string(),
+            ws_url,
             trading_op_tx,
             orders_sender,
             my_trades_sender,
@@ -81,17 +88,17 @@ impl OkxWsTradeClient {
     // 🔐 Subscriptions สำหรับ 3 Private Streams
     // ==========================================
 
-    /// 1. ฟัง Order Update สด (Orders stream)
+    /// ฟัง Order Update สด (Orders stream)
     pub fn subscribe_orders(&self) -> broadcast::Receiver<OkxOrderUpdateData> {
         self.orders_sender.subscribe()
     }
 
-    /// 2. ฟัง Execution Fill สด (My Trades stream)
+    /// ฟัง Execution Fill สด (My Trades stream)
     pub fn subscribe_my_trades(&self) -> broadcast::Receiver<OkxMyTradeData> {
         self.my_trades_sender.subscribe()
     }
 
-    /// 3. ฟัง Balance & Margin สด (Balance stream)
+    /// ฟัง Balance & Margin สด (Balance stream)
     pub fn subscribe_balance(&self) -> broadcast::Receiver<OkxAccountBalanceUpdate> {
         self.balance_sender.subscribe()
     }
@@ -100,7 +107,6 @@ impl OkxWsTradeClient {
     // 🔧 5 Trading Operations (Non-blocking Dispatch)
     // ==========================================
 
-    /// 1. Create Order (Single)
     pub async fn create_order_ws(&self, order: WsPlaceOrderArg) -> Result<(), WsTradeError> {
         self.trading_op_tx
             .send(WsTradingOp::CreateOrder(order))
@@ -108,7 +114,6 @@ impl OkxWsTradeClient {
             .map_err(|e| WsTradeError::QueueError(e.to_string()))
     }
 
-    /// 2. Batch Create Orders (สูงสุด 20 ไม้)
     pub async fn create_orders_ws(&self, orders: Vec<WsPlaceOrderArg>) -> Result<(), WsTradeError> {
         self.trading_op_tx
             .send(WsTradingOp::BatchCreateOrders(orders))
@@ -116,7 +121,6 @@ impl OkxWsTradeClient {
             .map_err(|e| WsTradeError::QueueError(e.to_string()))
     }
 
-    /// 3. Edit Order
     pub async fn edit_order_ws(&self, amend: WsAmendOrderArg) -> Result<(), WsTradeError> {
         self.trading_op_tx
             .send(WsTradingOp::EditOrder(amend))
@@ -124,7 +128,6 @@ impl OkxWsTradeClient {
             .map_err(|e| WsTradeError::QueueError(e.to_string()))
     }
 
-    /// 4. Cancel Order (Single)
     pub async fn cancel_order_ws(&self, cancel: WsCancelOrderArg) -> Result<(), WsTradeError> {
         self.trading_op_tx
             .send(WsTradingOp::CancelOrder(cancel))
@@ -132,7 +135,6 @@ impl OkxWsTradeClient {
             .map_err(|e| WsTradeError::QueueError(e.to_string()))
     }
 
-    /// 5. Batch Cancel Orders
     pub async fn cancel_orders_ws(&self, cancels: Vec<WsCancelOrderArg>) -> Result<(), WsTradeError> {
         self.trading_op_tx
             .send(WsTradingOp::BatchCancelOrders(cancels))
@@ -141,16 +143,15 @@ impl OkxWsTradeClient {
     }
 
     /// Helper สร้าง Login Payload ด้วย HMAC-SHA256
+    /// ⚠️ WebSocket Login ต้องใช้ Unix timestamp (seconds) ไม่ใช่ ISO 8601 เหมือน REST
     pub fn create_login_payload(
         api_key: &str,
         secret_key: &str,
         passphrase: &str,
     ) -> Result<WsLoginArg, WsTradeError> {
-        let timestamp = OkxSigner::generate_timestamp();
-        let method = "GET";
-        let request_path = "/users/self/verify";
-
-        let sign = OkxSigner::sign(&timestamp, method, request_path, None, secret_key)
+        // WS Login ต้องใช้ Unix seconds ไม่ใช่ ISO 8601
+        let timestamp = OkxSigner::generate_unix_timestamp();
+        let sign = OkxSigner::sign(&timestamp, "GET", "/users/self/verify", None, secret_key)
             .map_err(WsTradeError::SignerError)?;
 
         Ok(WsLoginArg {
@@ -159,5 +160,274 @@ impl OkxWsTradeClient {
             timestamp,
             sign,
         })
+    }
+
+    /// 🚀 สตาร์ท Background Task เชื่อมต่อ Private WebSocket
+    /// - Login ด้วย API credentials
+    /// - Subscribe: orders, fills channels
+    /// - Broadcast events กลับไปยัง subscribers
+    /// - อ่าน trading ops จาก channel แล้วยิงไปยัง OKX
+    pub fn start(
+        &self,
+        mut trading_op_rx: mpsc::Receiver<WsTradingOp>,
+        api_key: String,
+        secret_key: String,
+        passphrase: String,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::{json, Value};
+        use std::time::Duration;
+        use tokio::time::{interval, sleep};
+        use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+
+        let ws_url = self.ws_url.clone();
+        let orders_sender = self.orders_sender.clone();
+        let my_trades_sender = self.my_trades_sender.clone();
+        let balance_sender = self.balance_sender.clone();
+
+        tokio::spawn(async move {
+            let mut backoff_sec = 1u64;
+
+            loop {
+                log::info!("Connecting to OKX Private WebSocket: {}", ws_url);
+
+                let conn = connect_async(&ws_url).await;
+                match conn {
+                    Err(e) => {
+                        log::error!("Failed to connect to OKX Private WS: {}. Retrying in {}s...", e, backoff_sec);
+                        sleep(Duration::from_secs(backoff_sec)).await;
+                        backoff_sec = (backoff_sec * 2).min(30);
+                        continue;
+                    }
+                    Ok((ws_stream, _)) => {
+                        log::info!("Connected to OKX Private WebSocket successfully");
+                        backoff_sec = 1;
+
+                        let (mut write, mut read) = ws_stream.split();
+
+                        // --- Step 1: Login ---
+                        let login_result = Self::create_login_payload(&api_key, &secret_key, &passphrase);
+                        match login_result {
+                            Err(e) => {
+                                log::error!("Failed to build OKX WS login payload: {}", e);
+                                sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+                            Ok(login_payload) => {
+                                let login_msg = json!({ "op": "login", "args": [login_payload] });
+                                if let Ok(s) = serde_json::to_string(&login_msg) {
+                                    let _ = write.send(Message::Text(s.into())).await;
+                                }
+                            }
+                        }
+
+                        // --- Step 2: Wait for login ack ---
+                        let mut login_ok = false;
+                        'login_wait: loop {
+                            match read.next().await {
+                                Some(Ok(Message::Text(text))) => {
+                                    if let Ok(val) = serde_json::from_str::<Value>(&text) {
+                                        if val.get("event").and_then(|v| v.as_str()) == Some("login") {
+                                            let code = val.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                                            if code == "0" {
+                                                log::info!("OKX Private WS Login success ✅");
+                                                login_ok = true;
+                                            } else {
+                                                let msg = val.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                                log::error!("OKX Private WS Login FAILED: code={} msg={}", code, msg);
+                                            }
+                                            break 'login_wait;
+                                        }
+                                    }
+                                }
+                                Some(Ok(Message::Close(_))) | None => break 'login_wait,
+                                _ => {}
+                            }
+                        }
+
+                        if !login_ok {
+                            sleep(Duration::from_secs(backoff_sec)).await;
+                            backoff_sec = (backoff_sec * 2).min(30);
+                            continue;
+                        }
+
+                        // --- Step 3: Subscribe private channels ---
+                        // หมายเหตุ: `fills` channel ต้องการ VIP tier จึงตัดออก
+                        let sub_msg = json!({
+                            "op": "subscribe",
+                            "args": [
+                                { "channel": "orders", "instType": "SPOT" }
+                            ]
+                        });
+                        if let Ok(s) = serde_json::to_string(&sub_msg) {
+                            let _ = write.send(Message::Text(s.into())).await;
+                        }
+                        log::info!("OKX Private WS: subscribed to orders channel");
+
+                        // --- Step 4: Main event loop ---
+                        let mut ping_interval = interval(Duration::from_secs(20));
+                        let should_reconnect;
+
+                        loop {
+                            tokio::select! {
+                                _ = ping_interval.tick() => {
+                                    if let Err(e) = write.send(Message::Text("ping".into())).await {
+                                        log::warn!("OKX Private WS ping failed: {}", e);
+                                        should_reconnect = true;
+                                        break;
+                                    }
+                                }
+
+                                op = trading_op_rx.recv() => {
+                                    match op {
+                                        None => {
+                                            log::info!("OKX Private WS: trading op channel closed — bot stopped");
+                                            return; // clean exit, no reconnect
+                                        }
+                                        Some(trading_op) => {
+                                            // OKX WS id: alphanumeric เท่านั้น ไม่มี "-", max 32 chars
+                                            let req_id = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+                                            let payload = match &trading_op {
+                                                WsTradingOp::CreateOrder(arg) =>
+                                                    json!({ "id": req_id, "op": "order", "args": [arg] }),
+                                                WsTradingOp::BatchCreateOrders(args) =>
+                                                    json!({ "id": req_id, "op": "batch-orders", "args": args }),
+                                                WsTradingOp::EditOrder(arg) =>
+                                                    json!({ "id": req_id, "op": "amend-order", "args": [arg] }),
+                                                WsTradingOp::CancelOrder(arg) =>
+                                                    json!({ "id": req_id, "op": "cancel-order", "args": [arg] }),
+                                                WsTradingOp::BatchCancelOrders(args) =>
+                                                    json!({ "id": req_id, "op": "batch-cancel-orders", "args": args }),
+                                            };
+
+                                            match serde_json::to_string(&payload) {
+                                                Ok(json_str) => {
+                                                    log::debug!("OKX Private WS → Sending: {}", json_str);
+                                                    if let Err(e) = write.send(Message::Text(json_str.into())).await {
+                                                        log::error!("OKX Private WS send failed: {}", e);
+                                                        should_reconnect = true;
+                                                        break;
+                                                    }
+                                                }
+                                                Err(e) => log::error!("Failed to serialize trading op: {}", e),
+                                            }
+                                        }
+                                    }
+                                }
+
+                                msg = read.next() => {
+                                    match msg {
+                                        Some(Ok(Message::Text(text))) => {
+                                            if text == "pong" { continue; }
+                                            if let Ok(val) = serde_json::from_str::<Value>(&text) {
+                                                Self::handle_private_message(
+                                                    &val, &orders_sender, &my_trades_sender, &balance_sender
+                                                );
+                                            }
+                                        }
+                                        Some(Ok(Message::Close(_))) => {
+                                            log::warn!("OKX Private WS: server closed connection");
+                                            should_reconnect = true;
+                                            break;
+                                        }
+                                        Some(Err(e)) => {
+                                            log::error!("OKX Private WS read error: {}", e);
+                                            should_reconnect = true;
+                                            break;
+                                        }
+                                        None => {
+                                            log::warn!("OKX Private WS stream ended");
+                                            should_reconnect = true;
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+
+                        if !should_reconnect {
+                            return;
+                        }
+                    }
+                }
+
+                sleep(Duration::from_secs(backoff_sec)).await;
+                backoff_sec = (backoff_sec * 2).min(30);
+            }
+        });
+    }
+
+    /// แยกประมวลผล events จาก Private WS แล้ว broadcast ไปยัง receivers
+    fn handle_private_message(
+        val: &serde_json::Value,
+        orders_sender: &broadcast::Sender<OkxOrderUpdateData>,
+        my_trades_sender: &broadcast::Sender<OkxMyTradeData>,
+        balance_sender: &broadcast::Sender<OkxAccountBalanceUpdate>,
+    ) {
+        let channel = val
+            .get("arg")
+            .and_then(|a| a.get("channel"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+
+        if channel == "orders" {
+            if let Ok(data) = serde_json::from_value::<Vec<OkxOrderUpdateData>>(val["data"].clone()) {
+                for order in data {
+                    log::info!(
+                        "📋 Order Update: {} {} {} @ {} → state={}",
+                        order.inst_id, order.side, order.sz, order.px, order.state
+                    );
+                    let _ = orders_sender.send(order);
+                }
+            }
+        } else if channel == "fills" {
+            if let Ok(data) = serde_json::from_value::<Vec<OkxMyTradeData>>(val["data"].clone()) {
+                for fill in data {
+                    log::info!(
+                        "✅ Fill: {} {} {} @ {}",
+                        fill.inst_id, fill.side, fill.fill_size, fill.fill_price
+                    );
+                    let _ = my_trades_sender.send(fill);
+                }
+            }
+        } else if channel == "account" || channel == "balance_and_position" {
+            if let Ok(data) = serde_json::from_value::<Vec<OkxAccountBalanceUpdate>>(val["data"].clone()) {
+                for balance in data {
+                    let _ = balance_sender.send(balance);
+                }
+            }
+        } else if let Some(event) = val.get("event") {
+            if event.as_str() == Some("error") {
+                let code = val.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                let msg = val.get("msg").and_then(|v| v.as_str()).unwrap_or("");
+                log::error!("OKX Private WS error event: code={} msg={}", code, msg);
+            } else {
+                log::debug!("OKX Private WS event: {:?}", event);
+            }
+        } else if let Some(op) = val.get("op") {
+            // Trade op ack (order/cancel result)
+            let code = val.get("code").and_then(|v| v.as_str()).unwrap_or("");
+            let msg = val.get("msg").and_then(|v| v.as_str()).unwrap_or("");
+            if code == "0" {
+                // เช็คว่าใน data array มี sCode != "0" หรือไม่
+                if let Some(data_arr) = val.get("data").and_then(|d| d.as_array()) {
+                    for item in data_arr {
+                        let s_code = item.get("sCode").and_then(|c| c.as_str()).unwrap_or("0");
+                        let s_msg = item.get("sMsg").and_then(|m| m.as_str()).unwrap_or("");
+                        let cl_ord_id = item.get("clOrdId").and_then(|c| c.as_str()).unwrap_or("-");
+                        if s_code != "0" {
+                            log::error!("❌ OKX WS op='{}' item error: clOrdId={} code={} msg='{}'", op.as_str().unwrap_or("?"), cl_ord_id, s_code, s_msg);
+                        } else {
+                            log::info!("✅ OKX WS op='{}' success: clOrdId={}", op.as_str().unwrap_or("?"), cl_ord_id);
+                        }
+                    }
+                } else {
+                    log::info!("✅ OKX WS op='{}' success", op.as_str().unwrap_or("?"));
+                }
+            } else {
+                log::error!("❌ OKX WS op='{}' failed: {} (code={}) full={:?}", op.as_str().unwrap_or("?"), msg, code, val);
+            }
+        }
     }
 }

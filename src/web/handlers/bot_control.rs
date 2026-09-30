@@ -42,6 +42,10 @@ fn handle_strategy_error(err: StrategyServiceError) -> (StatusCode, axum::Json<s
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "success": false, "error": format!("Database error: {}", e) })),
         ),
+        StrategyServiceError::CryptoError(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "error": format!("Failed to decrypt account credentials: {}", e) })),
+        ),
     }
 }
 

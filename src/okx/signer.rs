@@ -8,10 +8,17 @@ type HmacSha256 = Hmac<Sha256>;
 pub struct OkxSigner;
 
 impl OkxSigner {
-    /// สร้าง ISO 8601 UTC Timestamp ตามรูปแบบที่ OKX v5 กำหนด
+    /// สร้าง ISO 8601 UTC Timestamp ตามรูปแบบที่ OKX v5 REST API กำหนด
     /// ตัวอย่าง: `2020-12-08T09:08:57.715Z`
     pub fn generate_timestamp() -> String {
         Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    }
+
+    /// สร้าง Unix Timestamp (seconds) สำหรับ WebSocket Login
+    /// OKX Private WS ต้องการ Unix seconds ไม่ใช่ ISO 8601
+    /// ตัวอย่าง: `1607393337`
+    pub fn generate_unix_timestamp() -> String {
+        Utc::now().timestamp().to_string()
     }
 
     /// สร้างลายเซ็น HMAC-SHA256 Base64 ตามกฎของ OKX v5

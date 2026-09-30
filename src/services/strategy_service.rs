@@ -4,10 +4,11 @@ use uuid::Uuid;
 
 use crate::{
     bot::manager::{BotManager, BotManagerError},
+    crypto::encryption::EncryptionService,
     domain::strategy::{
         BotResponse, CreateBotRequest, Strategy, StrategyStatus, UpdateBotRequest,
     },
-    okx::manager::OkxManager,
+    okx::{dto::market::WsSubscriptionArg, manager::OkxManager},
     storage::repositories::{
         account_repository::AccountRepository, strategy_repository::StrategyRepository,
     },
@@ -32,6 +33,9 @@ pub enum StrategyServiceError {
 
     #[error("Validation error: {0}")]
     ValidationError(String),
+
+    #[error("Crypto error: {0}")]
+    CryptoError(String),
 }
 
 /// Service สำหรับจัดการ Business Logic ของ Bot / Strategy
@@ -41,6 +45,7 @@ pub struct StrategyService {
     account_repo: Arc<AccountRepository>,
     bot_manager: BotManager,
     okx_manager: OkxManager,
+    encryption: Arc<EncryptionService>,
 }
 
 impl StrategyService {
@@ -49,12 +54,14 @@ impl StrategyService {
         account_repo: Arc<AccountRepository>,
         bot_manager: BotManager,
         okx_manager: OkxManager,
+        encryption: Arc<EncryptionService>,
     ) -> Self {
         Self {
             strategy_repo,
             account_repo,
             bot_manager,
             okx_manager,
+            encryption,
         }
     }
 
@@ -202,15 +209,56 @@ impl StrategyService {
             ));
         }
 
-        // อัปเดตสถานะใน DB
+        // --- โหลด Account Credentials ---
+        let account = self
+            .account_repo
+            .find_by_id_and_user_id(&strategy.account_id, user_id)
+            .await?
+            .ok_or(StrategyServiceError::AccountNotFound)?;
+
+        let secret_key = self
+            .encryption
+            .decrypt(&account.encrypted_secret)
+            .map_err(|e| StrategyServiceError::CryptoError(e.to_string()))?;
+
+        let passphrase = self
+            .encryption
+            .decrypt(&account.encrypted_passphrase)
+            .map_err(|e| StrategyServiceError::CryptoError(e.to_string()))?;
+
+        let api_key = account.api_key.clone();
+        let is_simulated = account.is_simulated;
+
+        log::info!(
+            "[Bot #{}] Starting bot '{}' (pair={}, simulated={})",
+            bot_id,
+            strategy.name,
+            strategy.pair,
+            is_simulated
+        );
+
+        // --- อัปเดตสถานะใน DB ---
         self.strategy_repo
             .update_status(bot_id, StrategyStatus::Running)
             .await?;
         strategy.status = StrategyStatus::Running;
 
-        // สั่ง BotManager รัน Background Task โดยใช้ Public WS ร่วมกัน
+        // --- สตาร์ท Public WebSocket (subscribe ticker สำหรับคู่เหรียญนี้) ---
         let public_ws = self.okx_manager.public_ws().clone();
-        self.bot_manager.start_bot(strategy.clone(), public_ws).await?;
+        let subscriptions = vec![WsSubscriptionArg::per_instrument("tickers", &strategy.pair)];
+        public_ws.start(subscriptions);
+
+        // --- สร้าง Trade Client พร้อม start() background task ---
+        let (trade_client, trading_op_rx) = crate::okx::ws_trade::OkxWsTradeClient::new(is_simulated);
+        trade_client.start(trading_op_rx, api_key, secret_key, passphrase);
+
+        // --- Rate Limiter ---
+        let rate_limiter = Arc::new(self.okx_manager.get_rate_limiter(&strategy.account_id).await);
+
+        // --- สั่ง BotManager spawn executor ---
+        self.bot_manager
+            .start_bot(strategy.clone(), public_ws, trade_client, rate_limiter)
+            .await?;
 
         Ok(strategy.to_response())
     }
