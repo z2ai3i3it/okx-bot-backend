@@ -1,9 +1,15 @@
+use std::{future::Future, pin::Pin};
+
 use crate::okx::dto::{
     market::OkxTickerData,
     trade::{
         OkxMyTradeData, OkxOrderUpdateData, WsAmendOrderArg, WsCancelOrderArg, WsPlaceOrderArg,
     },
 };
+use crate::domain::strategy::StrategyState;
+
+pub type StrategyRecoveryFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
 /// คำสั่งซื้อขายที่ Strategy ตัดสินใจส่งออกมาหลังจากประเมิน Event
 #[derive(Debug, Clone)]
@@ -26,6 +32,25 @@ pub enum StrategyAction {
 /// Interface หลักสำหรับทุก Trading Strategy
 /// ออกแบบให้รับ WebSocket Events ทั้ง Public และ Private แล้วคืนคำสั่ง Action ออกมา
 pub trait Strategy: Send + Sync {
+    fn runtime_state(&self) -> Option<StrategyState> {
+        None
+    }
+
+    fn restore_runtime_state(&mut self, _state: &StrategyState) {}
+
+    fn pending_cancel_orders(&self) -> Vec<WsCancelOrderArg> {
+        Vec::new()
+    }
+
+    /// Restore strategy-owned state before live market events can create new orders.
+    /// Strategies that do not persist recovery state may keep the default implementation.
+    fn recover<'a>(
+        &'a mut self,
+        missed_trades: &'a [OkxMyTradeData],
+    ) -> StrategyRecoveryFuture<'a> {
+        Box::pin(async move { self.on_recovery_reconcile(missed_trades) })
+    }
+
     /// รับ Ticker update จาก Public WebSocket (ราคา Bid, Ask, Last)
     /// คืนค่า Action ที่ต้องการส่งต่อเข้า Order Pipeline
     fn on_ticker(&mut self, ticker: &OkxTickerData) -> Vec<StrategyAction>;

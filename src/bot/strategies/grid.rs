@@ -19,6 +19,7 @@ pub struct GridStrategy {
     pub pair: String,
     pub order_size: String,
     pub tick_offset: Decimal,
+    pub inst_id_code: Option<u64>,
     pub has_placed_initial_orders: bool,
     pub active_buy_cl_ord_id: Option<String>,
     pub active_sell_cl_ord_id: Option<String>,
@@ -31,6 +32,7 @@ impl GridStrategy {
             pair,
             order_size,
             tick_offset: Decimal::from(5000),
+            inst_id_code: None,
             has_placed_initial_orders: false,
             active_buy_cl_ord_id: None,
             active_sell_cl_ord_id: None,
@@ -39,6 +41,11 @@ impl GridStrategy {
 
     pub fn with_tick_offset(mut self, offset: Decimal) -> Self {
         self.tick_offset = offset;
+        self
+    }
+
+    pub fn with_inst_id_code(mut self, code: u64) -> Self {
+        self.inst_id_code = Some(code);
         self
     }
 }
@@ -104,12 +111,7 @@ impl Strategy for GridStrategy {
             ask_px_str
         );
 
-        // OKX WS V5 กำหนดให้ส่ง instIdCode (สำหรับ BTC-USDT code = 3)
-        let inst_id_code = if self.pair == "BTC-USDT" {
-            Some(3)
-        } else {
-            None
-        };
+        let inst_id_code = self.inst_id_code;
 
         let buy_action = StrategyAction::PlaceOrder {
             arg: WsPlaceOrderArg {

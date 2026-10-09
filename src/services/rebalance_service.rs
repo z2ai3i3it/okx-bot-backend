@@ -32,9 +32,11 @@ impl RebalanceService {
         &self,
         bot_id: &str,
         order_id: &str,
+        trade_id: &str,
+        client_order_id: &str,
         record: &RebalanceRecord,
     ) -> Result<Rebalance, RebalanceServiceError> {
-        let entity = Rebalance::from_record(bot_id, order_id, record);
+        let entity = Rebalance::from_record(bot_id, order_id, trade_id, client_order_id, record);
         self.rebalance_repo.insert_record(&entity).await?;
         Ok(entity)
     }
@@ -52,6 +54,14 @@ impl RebalanceService {
     pub async fn count_by_bot(&self, bot_id: &str) -> Result<u64, RebalanceServiceError> {
         let count = self.rebalance_repo.count_by_bot(bot_id).await?;
         Ok(count)
+    }
+
+    pub async fn trade_exists(
+        &self,
+        bot_id: &str,
+        trade_id: &str,
+    ) -> Result<bool, RebalanceServiceError> {
+        Ok(self.rebalance_repo.trade_exists(bot_id, trade_id).await?)
     }
 }
 

@@ -20,6 +20,7 @@ use okx::rest_client::OkxRestClient;
 use services::strategy_service::StrategyService;
 use storage::db::init_db;
 use storage::repositories::account_repository::AccountRepository;
+use storage::repositories::rebalance_repository::RebalanceRepository;
 use storage::repositories::strategy_repository::StrategyRepository;
 use storage::repositories::user_repository::UserRepository;
 use users::account_service::AccountService;
@@ -57,7 +58,11 @@ async fn main() {
 
     let okx_rest_client = Arc::new(OkxRestClient::new());
     let okx_manager = OkxManager::new();
-    let bot_manager = BotManager::new();
+    let rebalance_repo = Arc::new(RebalanceRepository::new(&db));
+    let rebalance_service = Arc::new(services::rebalance_service::RebalanceService::new(
+        rebalance_repo,
+    ));
+    let bot_manager = BotManager::new(rebalance_service, strategy_repo.clone());
 
     let account_service = AccountService::new(
         account_repo.clone(),
@@ -70,6 +75,7 @@ async fn main() {
         account_repo,
         bot_manager,
         okx_manager,
+        okx_rest_client,
         encryption_service.clone(),
     );
 

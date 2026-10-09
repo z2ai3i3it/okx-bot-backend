@@ -7,6 +7,9 @@ use crate::{
     bot::executor::BotExecutor,
     domain::strategy::Strategy,
     okx::ws_client::OkxPublicWsClient,
+    okx::rest_client::{OkxRestClient, OkxRestCredentials},
+    services::rebalance_service::RebalanceService,
+    storage::repositories::strategy_repository::StrategyRepository,
 };
 
 #[derive(Debug, Error)]
@@ -24,12 +27,19 @@ pub enum BotManagerError {
 pub struct BotManager {
     /// บันทึก CancellationToken ของบอทที่กำลังรันอยู่ (Key คือ Bot ID)
     active_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    rebalance_service: Arc<RebalanceService>,
+    strategy_repository: Arc<StrategyRepository>,
 }
 
 impl BotManager {
-    pub fn new() -> Self {
+    pub fn new(
+        rebalance_service: Arc<RebalanceService>,
+        strategy_repository: Arc<StrategyRepository>,
+    ) -> Self {
         Self {
             active_tokens: Arc::new(RwLock::new(HashMap::new())),
+            rebalance_service,
+            strategy_repository,
         }
     }
 
@@ -46,6 +56,9 @@ impl BotManager {
         public_ws: OkxPublicWsClient,
         trade_client: crate::okx::ws_trade::OkxWsTradeClient,
         rate_limiter: Arc<crate::okx::rate_limiter::OkxRateLimiter>,
+        rest_client: Arc<OkxRestClient>,
+        rest_credentials: OkxRestCredentials,
+        inst_id_code: Option<u64>,
     ) -> Result<(), BotManagerError> {
         let bot_id = strategy.id.clone();
 
@@ -63,12 +76,18 @@ impl BotManager {
             rate_limiter,
             trade_client.clone(),
         );
-        let executor = BotExecutor::new(
+        let executor = BotExecutor::with_dependencies(
             strategy,
             public_ws,
             trade_client,
             pipeline,
+            Some(self.rebalance_service.clone()),
+            Some(self.strategy_repository.clone()),
+            Some(rest_client),
+            Some(rest_credentials),
+            Vec::new(),
             cancel_token,
+            inst_id_code,
         );
         let tokens_map = self.active_tokens.clone();
         let task_bot_id = bot_id.clone();
@@ -93,11 +112,5 @@ impl BotManager {
         } else {
             Err(BotManagerError::NotRunning(bot_id.to_string()))
         }
-    }
-}
-
-impl Default for BotManager {
-    fn default() -> Self {
-        Self::new()
     }
 }

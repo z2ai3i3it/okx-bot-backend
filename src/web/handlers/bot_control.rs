@@ -46,6 +46,10 @@ fn handle_strategy_error(err: StrategyServiceError) -> (StatusCode, axum::Json<s
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "success": false, "error": format!("Failed to decrypt account credentials: {}", e) })),
         ),
+        StrategyServiceError::OkxApiError(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({ "success": false, "error": format!("OKX API error: {}", e) })),
+        ),
     }
 }
 

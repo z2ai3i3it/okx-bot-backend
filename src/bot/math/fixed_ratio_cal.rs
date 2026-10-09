@@ -37,7 +37,7 @@ pub(crate) fn rounddown(value: Decimal, decimal_factor: Decimal) -> Decimal {
 
 /// python: roundup()
 /// พฤติกรรมจริง = ปัดออกจาก 0 (round away from zero) เป็นทวีคูณของ decimal_factor
-pub(crate) fn roundup(value: Decimal, decimal_factor: Decimal) -> Decimal {
+pub fn roundup(value: Decimal, decimal_factor: Decimal) -> Decimal {
     if decimal_factor.is_zero() {
         return value;
     }

@@ -372,6 +372,7 @@ impl OkxWsTradeClient {
             .unwrap_or("");
 
         if channel == "orders" {
+            log::debug!("📨 OKX raw orders payload: {}", val);
             if let Ok(data) = serde_json::from_value::<Vec<OkxOrderUpdateData>>(val["data"].clone()) {
                 for order in data {
                     log::info!(

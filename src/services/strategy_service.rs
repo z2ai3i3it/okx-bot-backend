@@ -8,7 +8,11 @@ use crate::{
     domain::strategy::{
         BotResponse, CreateBotRequest, Strategy, StrategyStatus, UpdateBotRequest,
     },
-    okx::{dto::market::WsSubscriptionArg, manager::OkxManager},
+    okx::{
+        dto::market::WsSubscriptionArg,
+        manager::OkxManager,
+        rest_client::{OkxRestClient, OkxRestCredentials},
+    },
     storage::repositories::{
         account_repository::AccountRepository, strategy_repository::StrategyRepository,
     },
@@ -36,6 +40,9 @@ pub enum StrategyServiceError {
 
     #[error("Crypto error: {0}")]
     CryptoError(String),
+
+    #[error("OKX API error: {0}")]
+    OkxApiError(#[from] crate::okx::rest_client::OkxClientError),
 }
 
 /// Service สำหรับจัดการ Business Logic ของ Bot / Strategy
@@ -45,6 +52,7 @@ pub struct StrategyService {
     account_repo: Arc<AccountRepository>,
     bot_manager: BotManager,
     okx_manager: OkxManager,
+    okx_rest_client: Arc<OkxRestClient>,
     encryption: Arc<EncryptionService>,
 }
 
@@ -54,6 +62,7 @@ impl StrategyService {
         account_repo: Arc<AccountRepository>,
         bot_manager: BotManager,
         okx_manager: OkxManager,
+        okx_rest_client: Arc<OkxRestClient>,
         encryption: Arc<EncryptionService>,
     ) -> Self {
         Self {
@@ -61,6 +70,7 @@ impl StrategyService {
             account_repo,
             bot_manager,
             okx_manager,
+            okx_rest_client,
             encryption,
         }
     }
@@ -228,6 +238,12 @@ impl StrategyService {
 
         let api_key = account.api_key.clone();
         let is_simulated = account.is_simulated;
+        let rest_credentials = OkxRestCredentials {
+            api_key: api_key.clone(),
+            secret_key: secret_key.clone(),
+            passphrase: passphrase.clone(),
+            is_simulated,
+        };
 
         log::info!(
             "[Bot #{}] Starting bot '{}' (pair={}, simulated={})",
@@ -236,6 +252,37 @@ impl StrategyService {
             strategy.pair,
             is_simulated
         );
+
+        // --- Pre-flight Check: ดึง instIdCode สำหรับ OKX V5 Private WebSocket ผ่าน REST API ---
+        log::info!(
+            "[Bot #{}] Fetching instIdCode for instrument '{}'...",
+            bot_id,
+            strategy.pair
+        );
+        let inst_id_code = match self
+            .okx_rest_client
+            .get_instrument_code(&rest_credentials, "SPOT", &strategy.pair)
+            .await
+        {
+            Ok(code) => {
+                log::info!(
+                    "[Bot #{}] ✅ Resolved instIdCode={} for '{}'",
+                    bot_id,
+                    code,
+                    strategy.pair
+                );
+                Some(code)
+            }
+            Err(err) => {
+                log::error!(
+                    "[Bot #{}] ❌ Failed to fetch instIdCode for '{}': {}",
+                    bot_id,
+                    strategy.pair,
+                    err
+                );
+                return Err(StrategyServiceError::OkxApiError(err));
+            }
+        };
 
         // --- อัปเดตสถานะใน DB ---
         self.strategy_repo
@@ -257,7 +304,15 @@ impl StrategyService {
 
         // --- สั่ง BotManager spawn executor ---
         self.bot_manager
-            .start_bot(strategy.clone(), public_ws, trade_client, rate_limiter)
+            .start_bot(
+                strategy.clone(),
+                public_ws,
+                trade_client,
+                rate_limiter,
+                self.okx_rest_client.clone(),
+                rest_credentials,
+                inst_id_code,
+            )
             .await?;
 
         Ok(strategy.to_response())

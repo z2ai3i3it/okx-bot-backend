@@ -6,7 +6,7 @@ use mongodb::{
     Collection, Database,
 };
 
-use crate::domain::strategy::{Strategy, StrategyConfig, StrategyStatus};
+use crate::domain::strategy::{Strategy, StrategyConfig, StrategyState, StrategyStatus};
 
 pub struct StrategyRepository {
     collection: Collection<Strategy>,
@@ -84,6 +84,25 @@ impl StrategyRepository {
         let update = doc! {
             "$set": {
                 "status": status_bson,
+                "updated_at": to_bson(&Utc::now()).unwrap_or_default()
+            }
+        };
+
+        let result = self.collection.update_one(filter, update).await?;
+        Ok(result.matched_count > 0)
+    }
+
+    /// Persist dynamic tracked-order state without replacing strategy configuration.
+    pub async fn update_runtime_state(
+        &self,
+        id: &str,
+        state: StrategyState,
+    ) -> MongoResult<bool> {
+        let state_bson = to_bson(&state).unwrap_or_default();
+        let filter = doc! { "id": id };
+        let update = doc! {
+            "$set": {
+                "state": state_bson,
                 "updated_at": to_bson(&Utc::now()).unwrap_or_default()
             }
         };

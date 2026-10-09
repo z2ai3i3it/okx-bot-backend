@@ -161,6 +161,21 @@
 
 3. **Chasing Market Price (Optional Feature ใน Python)**
    - ฟีเจอร์ไล่ราคาตลาดตาม Spread / Depth ใน `logs/fixed_ratio.py` ยังไม่ได้นำมาใส่
+   - **สถาปัตยกรรมและ Logic การทำงานของ Chasing:**
+     1. **เป้าหมายและหัวใจสำคัญ (Why Chasing?):**
+        - ปรับพอร์ตให้ Match สำเร็จตามเป้าหมายโดย **ไม่ใช้ Market Order (Taker)** เพื่อหลีกเลี่ยง Fee แพงและ Slippage
+        - ป้องกันออเดอร์ค้าง (Stuck Limit Order) เมื่อราคาตลาดวิ่งหนี ด้วยการส่งคำสั่งเป็น Maker ล่วงหน้า แล้วใช้ Background Task ไล่ขยับราคา (`amend_order`) เกาะหัวแถวของ Orderbook ไปเรื่อยๆ จนกว่าจะ Fill ครบ
+     2. **วงจรการทำงาน (Lifecycle & Flow):**
+        - **Initial Order Placement (`_create_order_intent_at_market`):** วางคำสั่งแรกโดยเว้นระยะห่างปลอดภัย (Offset 100 ticks หรือ TR) ฝั่ง Buy ต่ำกว่าตลาด / ฝั่ง Sell สูงกว่าตลาด เพื่อเป็น Buffer ป้องกันการ Match ทันทีเป็น Taker
+        - **Chasing Loop (`_chasing_order_loop`):** วนลูปตรวจสอบ Best Bid / Best Ask ใน Orderbook:
+          - *กรณี Spread กว้าง ($\ge 3$ ticks):* แทรกกลาง Spread (Inside Spread) โดย Buy ตั้ง `bid1 + 1 tick`, Sell ตั้ง `ask1 - 1 tick` เพื่อขึ้นมาเป็น Best Price คิวแรก
+          - *กรณี Spread แคบ ($< 3$ ticks):* วางเกาะชิด Best Bid/Ask พร้อมเว้น Safety Margin ไม่ให้ข้ามฝั่งไปชนราคาตลาด
+          - *การปรับราคา:* ส่ง `amend_order` อัปเดตราคาใหม่ และจบ Loop ทันทีเมื่อออเดอร์ `filled`, `canceled` หรือเหลือปริมาณ 0
+     3. **เงื่อนไขที่เรียกใช้ Chasing (Trigger Cases):**
+        - **First Rebalance:** เริ่มต้นรันบอทครั้งแรกแล้วพอร์ตไม่อยู่ในจุดสมดุล (Imbalance เกิน Threshold) ต้องบังคับปรับพอร์ตให้เข้าที่ก่อน
+        - **Self-Healing / Incomplete Fill:** มีออเดอร์หลุด ค้าง หรือการ Rebalance ขาดช่วง บอทสร้างออเดอร์ซ่อมแซมเพื่อดึงพอร์ตกลับมาสมดุล
+        - **Unplanned Cancel Healing:** คำสั่งถูกยกเลิกผิดปกติจาก Exchange ระหว่างรอบ Rebalance
+        *(หมายเหตุ: คำสั่ง Rebalance ปกติแบบ Grid / Ladder จะวางแช่รอ Fill ตามระดับราคา ไม่เข้า Chasing)*
 
 ---
 
@@ -208,9 +223,187 @@
     - นำ Trades ที่ได้มา Sort ตาม Timestamp (เก่า $\rightarrow$ ใหม่)
     - Replay ทีละ Trade ผ่านสูตรคำนวณ `save_to_db_filled_rebalance`
     - ตั้งค่า `self.snapshot` ล่าสุดให้พร้อมสำหรับการคำนวณ Rebalance รอบแรกทันทีที่เข้า Event Loop
-
+  
 - [x] **7.5 Layer 7 Integration: เชื่อมต่อเข้ากับ `BotExecutor` (`src/bot/executor.rs`)**
   - [x] ใน `BotExecutor::run()`:
     - เรียก `RecoveryEngine::run_recovery()` ให้เรียบร้อยก่อนเปิดรับ WebSocket Event Loop
     - เมื่อมี Event `on_fill_update` ใน Strategy $\rightarrow$ ส่ง Record บันทึกลง Database ผ่าน `RebalanceService` แบบ Non-blocking Async Task
   - [x] Unit Test & Verification: ทดสอบ Recovery Flow จำลองทั้งกรณีไม่มีออเดอร์ค้าง และกรณีมี Missed Trades ตกค้าง
+
+---
+
+## Phase 8: Chasing Market Price (Event-driven via Ticker/Orderbook)
+
+- [x] **8.1 สร้าง Action และ State Engine สำหรับ Chasing (Pure Strategy State Machine)**
+  - [x] ตรวจสอบ `StrategyAction::AmendOrder(WsAmendOrderArg)` และการ dispatch เข้า Pipeline / WebSocket
+  - [x] ออกแบบ `ChasingState` ภายใน `FixedRatioStrategy` ติดตาม `client_order_id`, `side`, `current_price`, `anchor_price`, `last_amend_time`
+  - [x] Implement ตรรกะ `calculate_chasing_price` (Spread $\ge 3$ ticks vs $< 3$ ticks พร้อม Anchor Clamping)
+  - [x] Throttle ป้องกันการยิง amend order ถี่เกิน 500ms
+
+- [x] **8.2 เรียกใช้ Chasing ใน Case ที่ 1: First Rebalance (`on_ticker`)**
+  - [x] ใน `on_ticker`: หากเกิด Imbalance วาง Initial Order หลบราคาตลาด (Buffer 100 ticks) และเซ็ต `chasing_state`
+  - [x] ใน Ticker ถัดๆ ไป: หากมี `chasing_state` ให้คำนวณราคาใหม่และ emit `StrategyAction::AmendOrder`
+  - [x] ใน `try_finalize_order` และ `on_order_update`: เมื่อออเดอร์มีสถานะ `filled`, `canceled` เคลียร์ `chasing_state = None`
+  - [x] Unit Test `test_chasing_order_loop_amends_price_and_finalizes` ผ่านเรียบร้อย (35 passed)
+
+- [x] **8.3 Self-Healing: Order Placement Rejected / Post-Only Rejection**
+
+  **ที่มา (Legacy Ref):**
+  - Python `on_order_placement_failed` (L708–L791): แยก error_type เป็น `InvalidOrder`, `OrderImmediatelyFillable`, `OrderNotFillable`, `InsufficientFunds`, `NetworkError`
+  - Python `_on_order_rejected` (L1146–L1165): อัปเดต tracked status เป็น REJECTED
+  - Rust `send_order_with_healing` (L714–L793): ถ้าวาง post_only ล้มเหลว → วางใหม่ผ่าน `create_order_at_market`
+
+  **Edge Cases ที่ต้องจัดการใน `on_order_update`:**
+
+  - [x] **8.3.1 Post-Only Rejection (OKX sCode ≠ 0)**
+    - Trigger: OKX reject เพราะ post_only order จะ cross ทันที (OrderImmediatelyFillable)
+    - Action: สร้าง order ใหม่ผ่าน `create_order_intent_at_market` (วางหลบ 100 ticks) → ผูกเข้า `ChasingState` ใหม่
+    - Python Ref: `on_order_placement_failed` case `OrderImmediatelyFillable` / `InvalidOrder` / `OrderNotFillable`
+    - ⚠️ ได้ `side`, `amount`, `anchor_price` จาก tracked order เดิม / snapshot เรียบร้อย
+
+  - [x] **8.3.2 Insufficient Funds (OKX sCode 51010/51015 / cancelSource 9, 44)**
+    - Trigger: ยอดเงินไม่พอสำหรับฝั่งนี้ (เช่น ฝั่ง sibling ยังไม่ fill คืน capital)
+    - Action: **ไม่ heal** — เคลียร์ tracked ฝั่งนี้ ปล่อยให้ rebalance รอบถัดไปลองใหม่
+    - Python Ref: `on_order_placement_failed` case `InsufficientFunds` → PARKED
+    - Rust Ref: `send_order_with_healing` → `Ok(None)`
+
+  - [x] **8.3.3 Rate Limit (OKX 50011 / HTTP 429)**
+    - Trigger: ยิง API ถี่เกิน OKX rate limit
+    - Action: **ไม่ heal** ทันที — ตรวจสอบ sCode/cancelSource ไม่เข้าเงื่อนไข heal และป้องกันการ re-place ถี่เกิน
+    - Python Ref: `on_order_placement_failed` case `NetworkError`
+    - Rust Ref: `send_order_with_healing` → `Err` + `is_rate_limit_error`
+
+  - [x] **8.3.4 Network / Timeout Error**
+    - Trigger: response หาย (timeout, DNS, TLS error) → ไม่รู้ว่า order เกิดบน exchange หรือไม่
+    - Action: **เก็บ tracked ไว้** ไม่ล้าง → WebSocket reconnect / recovery engine จะ poll สถานะจาก exchange
+      - ถ้า order มีจริง → adopt (chasing ต่อ)
+      - ถ้า order ไม่มี (51603) → recovery engine จัดการ clean slate
+    - Python Ref: `on_order_placement_failed` case `NetworkError` / `RequestTimeout`
+    - Rust Ref: rebalance_first/rebalance_cal `Err(e)` → เก็บ tracked + back off
+
+  - [x] **8.3.5 Amend Order ล้มเหลวระหว่าง Chasing**
+    - Trigger: `AmendOrder` ถูก reject (เช่น order filled ระหว่าง amend, หรือ rate limit)
+    - Action: เช็คสถานะ —
+      - ถ้า order หายไปแล้ว (filled/canceled) → `on_order_update` เคลียร์ `chasing_state` อัตโนมัติ
+      - ถ้า transient → เก็บ `chasing_state` ไว้ ลองคำนวณและ amend ใหม่ในรอบ ticker ถัดไป (มี throttle 500ms guard)
+    - Python Ref: `_chasing_market_price` L598-L612 catch `ValueError` → break/continue
+
+  - [x] **8.3.6 Unit Test สำหรับ Self-Healing Cases**
+    - `test_self_healing_post_only_rejection_replaces_at_market` ผ่านเรียบร้อย
+    - `test_insufficient_funds_does_not_heal_and_finalizes` ผ่านเรียบร้อย (37 tests passed)
+
+- [x] **8.4 Unplanned Cancel Healing: Order ถูก Cancel โดย Exchange/ระบบ**
+
+  **ที่มา (Legacy Ref):**
+  - Python `_on_order_canceled` (L1060–L1145): แยก Planned vs Unplanned cancel ผ่าน `cancelSource` + `intent_status`
+  - Python `_on_rqm_stale_droped` (L881–L951): จัดการ RQM queue drop (placement / cancel type)
+  - Python `_on_rqm_stale_droped_v3` (L955–L1057): version ใหม่ที่แยก self-healing ชัดเจนกว่า
+  - Rust `check_and_handle_order_fill_v3` (L1379–L1539): แยก zero-fill cancel vs partial-fill cancel
+
+  **วิธีแยก Planned vs Unplanned Cancel:**
+
+  | สถานการณ์ | ประเภท | ตัวบ่งชี้ | Action |
+  |-----------|--------|----------|--------|
+  | Sibling ถูก cancel เพราะอีกฝั่ง filled | **Planned** | `planned_cancel_order_ids.contains(clOrdId)` | ❌ ไม่ heal — finalize ปกติ |
+  | User กด cancel เองจากภายนอก | **Planned / External** | `cancelSource == "1"` | ❌ ไม่ heal |
+  | Strategy สั่ง cancel ภายใน | **Planned** | `planned_cancel_order_ids.contains(clOrdId)` | ❌ ไม่ heal — finalize |
+  | OKX system cancel (zero fill) | **Unplanned** | `cancelSource == "0" / "31"` && `fill_sz == 0` | ✅ Heal → วางใหม่ |
+  | Partial fill cancel | **Unplanned** | `fill_sz > 0` && `cancel` | ⏳ รอ trade fills + cancel sibling |
+
+  **Edge Cases ที่จัดการแล้วใน `on_order_update`:**
+
+  - [x] **8.4.1 Unplanned Cancel — Zero Fill (ไม่มี partial fill)**
+    - Trigger: order ถูก cancel โดยไม่มี fill เลย (cancelSource = "0", "31", etc.)
+    - Action: วาง order ใหม่ด้วย `create_order_intent_at_market` (หลบ 100 ticks) → ผูก `ChasingState` ใหม่
+    - Balance ไม่เปลี่ยน → ไม่ต้อง rebalance ใหม่ แค่ heal ฝั่งเดิม
+
+  - [x] **8.4.2 Unplanned Cancel — มี Partial Fill ค้าง**
+    - Trigger: order ถูก cancel แต่มี fill บางส่วนแล้ว (acc_fill_sz > 0)
+    - Action:
+      1. นำลง `last_trade_waiters` เพื่อรอ Trade Fills มาครบ (balance จะถูกอัปเดตใน `on_fill_update`)
+      2. สั่ง Cancel sibling order ทันที เพราะ balance เปลี่ยนแล้ว
+      3. เมื่อ trade fills ครบ `try_finalize_order` จะ trigger rebalance ใหม่รอบถัดไป
+
+  - [x] **8.4.3 Planned Cancel — Sibling Cleanup (อีกฝั่ง filled)**
+    - Trigger: order ฝั่ง buy filled → strategy สั่ง cancel order ฝั่ง sell (หรือกลับกัน)
+    - Action: บันทึกเข้า `planned_cancel_order_ids` → เมื่อ cancel event กลับมา **ไม่ heal** → finalize ตามปกติ
+
+  - [x] **8.4.4 Cancel ระหว่าง Chasing Loop**
+    - Trigger: order ถูก cancel ขณะที่ `ChasingState` ยังทำงานอยู่
+    - Action:
+      - ถ้า Planned (sibling cleanup): เคลียร์ `chasing_state = None` → finalize ปกติ
+      - ถ้า Unplanned: เคลียร์ `chasing_state` เดิม → วาง order ใหม่ → ตั้ง `ChasingState` ใหม่
+
+  - [x] **8.4.5 OKX cancelSource Mapping**
+    - ใช้ field `cancelSource` จาก OKX Order WS event เพื่อแยก Planned vs Unplanned:
+      - `"0"` = order cancel by system → **Unplanned** (Heal ถ้า zero fill)
+      - `"1"` = user cancel → ตรวจสอบ `planned_cancel_order_ids` ถ้าใช่ planned ภายใน หรือ external user cancel → **ไม่ heal**
+    - 📄 รายละเอียดค่า cancelSource ทั้งหมดและการจัดกลุ่มดูที่ [OKX_CANCEL_SOURCE.md](./OKX_CANCEL_SOURCE.md)
+
+  - [x] **8.4.6 Unit Test สำหรับ Unplanned Cancel Healing Cases**
+    - `test_unplanned_cancel_zero_fill_heals_order_at_market` ผ่านเรียบร้อย
+    - `test_planned_cancel_sibling_cleanup_does_not_heal` ผ่านเรียบร้อย
+    - `test_unplanned_cancel_with_partial_fill_waits_and_cancels_sibling` ผ่านเรียบร้อย
+    - `test_external_user_cancel_source_1_finalizes_without_heal` ผ่านเรียบร้อย (41 tests passed)
+
+- [ ] **9. CEM Gatekeeper (Capital Efficiency Manager)**
+  - **Context:** 1 account → หลาย bot → หลาย pair → ต้อง share capital ข้าม bot
+  - **Legacy Ref:** [capital_efficiency_manager.py](./logs/capital_efficiency_manager.py), [cem_simulate_cancel_plan.py](./logs/cem_simulate_cancel_plan.py)
+  - **Analysis:** [cem_analysis.md](CEM Analysis Artifact)
+
+  - [ ] **9.1 Balance Snapshot + Virtual Lock**
+    - [ ] สร้าง `BalanceManager` struct: `HashMap<String, BalanceEntry>` (free/used/total per asset)
+    - [ ] Subscribe OKX WS `account` channel เพื่อรับ balance update real-time
+    - [ ] Virtual Lock: เมื่อ approve intent → หัก `free`, เพิ่ม `used`
+    - [ ] Virtual Unlock: เมื่อ cancel/fill/reject → คืน `used` กลับ `free`
+    - [ ] Re-apply locks เมื่อ WS balance update มาใหม่ (ป้องกัน ground-truth override virtual state)
+    - Legacy ref: `_check_and_approve_fast()` L625-665, `_release_capital()` L338-364, `_process_balance_update()` L413-443
+
+  - [ ] **9.2 CEM Gate — Approve / Reject**
+    - [ ] แปลง `CemStep` จาก pass-through เป็น real gate
+    - [ ] Logic: `if balance.free >= estimated_cost → approve, else → trigger cancel plan or park`
+    - [ ] CEM ต้องเป็น shared state ข้าม bot (Arc<Mutex<CEM>>) เพราะ 1 account ใช้ร่วมกัน
+    - [ ] PlaceOrder: ต้อง estimate cost (amount × price สำหรับ buy, amount สำหรับ sell)
+    - [ ] AmendOrder: คำนวณ cost diff (ถ้าราคาเปลี่ยน cost อาจเพิ่ม/ลด)
+    - [ ] CancelOrder: ปล่อยผ่านเสมอ (cancel ไม่ใช้ capital เพิ่ม)
+    - Legacy ref: `_process_order_intent()` L370-382
+
+  - [ ] **9.3 Cancel Plan (simulate_cancel_plan)**
+    - [ ] Port `simulate_cancel_plan()` เป็น Rust pure function
+    - [ ] Price Conversion: แปลงราคาทุก order เป็น BTC/USDT scale เพื่อเปรียบเทียบข้าม pair
+      - Case 1: `BTC/USDT` → ไม่แปลง
+      - Case 2: `XXX/BTC` → `mid_xxxusdt / order_price`
+      - Case 3: `XXX/USDT` → `(order_price / mid_xxxusdt) * mid_btcusdt`
+      - Case 4: `XXX/YYY` → via USDT intermediary
+    - [ ] Distance Score: `abs(converted_price - mid_btcusdt)` → ไกล = cancel ก่อน, ใกล้ = เก็บไว้
+    - [ ] Algorithm: cumulative cancel จาก furthest จนกว่า `freed >= deficit`
+    - [ ] Smart Parking: ถ้า `freed > deficit` → ใช้ surplus เก็บ order ที่ใกล้ mid ที่สุดไว้
+    - [ ] Fallback: ถ้าไม่มี mid price → ใช้ simple priority-based plan
+    - Legacy ref: `simulate_cancel_plan()` ทั้งไฟล์, `_simulate_and_handle_plan()` L667-759
+
+  - [ ] **9.4 Tracked Orders Pool**
+    - [ ] `HashMap<String, TrackedOrder>` — เก็บ intent ทุกตัวที่ CEM รับรู้
+    - [ ] IntentStatus: `Approved → Submitted → Open → Closed/Canceled/Rejected` + `Parked` + `CancelPending`
+    - [ ] Heartbeat cleanup: ลบ terminal states หลัง cooldown (60s)
+    - Legacy ref: `tracked_orders` dict, `_process_exchange_event()` L445-513
+
+  - [ ] **9.5 Parked Orders & Reevaluation**
+    - [ ] เมื่อ intent ถูก park → เก็บไว้ใน pool พร้อม `cem_priority` (distance score)
+    - [ ] เมื่อ balance เปลี่ยน (cancel สำเร็จ, fill สำเร็จ) → trigger `reevaluate_parked_orders()`
+    - [ ] Sort parked orders by `(cem_priority, -created_at)` → reactivate ตัวที่ใกล้ mid สุดก่อน
+    - [ ] เมื่อ reactivate: re-lock capital + emit approval
+    - Legacy ref: `_reevaluate_parked_orders()` L837-901
+
+  - [ ] **9.6 Integration with Pipeline & Strategy**
+    - [ ] CEM เป็น shared resource ใน `OrderPipeline` → inject via `Arc<CemManager>`
+    - [ ] Strategy ส่ง `StrategyAction` → Pipeline → CEM gate → approve/reject/park
+    - [ ] เมื่อ reject: pipeline return `Err` → strategy จัดการ (อิง legacy: park + reevaluate)
+    - [ ] เมื่อ exchange event (fill/cancel) → notify CEM เพื่อ unlock capital + reevaluate parked
+
+  - [ ] **9.7 Unit Tests**
+    - [ ] Balance virtual lock/unlock
+    - [ ] Approve fast path (เงินพอ)
+    - [ ] Cancel plan generation (เงินไม่พอ → cancel ตัวไกล)
+    - [ ] Smart parking (surplus → เก็บตัวใกล้)
+    - [ ] Parked order reevaluation (balance เปลี่ยน → reactivate)
+    - [ ] Multi-bot competition (2 bot แย่ง capital asset เดียวกัน)

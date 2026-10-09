@@ -14,6 +14,8 @@ pub struct Rebalance {
     pub bot_id: String,
     #[serde(rename = "ordId")]
     pub order_id: String,
+    #[serde(rename = "tradeId", default)]
+    pub trade_id: String,
     #[serde(rename = "clOrdId")]
     pub cl_ord_id: String,
     pub sequence: u64,
@@ -70,6 +72,7 @@ impl Rebalance {
             id: uuid::Uuid::new_v4().to_string(),
             bot_id,
             order_id,
+            trade_id: String::new(),
             cl_ord_id,
             sequence,
             symbol,
@@ -98,6 +101,8 @@ impl Rebalance {
     pub fn from_record(
         bot_id: &str,
         order_id: &str,
+        trade_id: &str,
+        client_order_id: &str,
         record: &crate::bot::math::fixed_ratio_cal::RebalanceRecord,
     ) -> Self {
         Self {
@@ -108,7 +113,8 @@ impl Rebalance {
             },
             bot_id: bot_id.to_string(),
             order_id: order_id.to_string(),
-            cl_ord_id: record.cl_ord_id.clone(),
+            trade_id: trade_id.to_string(),
+            cl_ord_id: client_order_id.to_string(),
             sequence: record.sequence,
             symbol: record.symbol.clone(),
             order_type: record.order_type.clone(),

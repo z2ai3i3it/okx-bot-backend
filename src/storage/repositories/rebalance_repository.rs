@@ -37,6 +37,11 @@ impl RebalanceRepository {
         let filter = doc! { "bot_id": bot_id };
         self.collection.count_documents(filter).await
     }
+
+    pub async fn trade_exists(&self, bot_id: &str, trade_id: &str) -> MongoResult<bool> {
+        let filter = doc! { "bot_id": bot_id, "tradeId": trade_id };
+        Ok(self.collection.count_documents(filter).await? > 0)
+    }
 }
 
 #[cfg(test)]
