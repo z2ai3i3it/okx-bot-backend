@@ -29,6 +29,19 @@ impl OrderPipeline {
         }
     }
 
+    pub fn with_cem(
+        rate_limiter: Arc<OkxRateLimiter>,
+        trade_client: OkxWsTradeClient,
+        cem: CemStep,
+    ) -> Self {
+        Self {
+            dedup: DedupStep::new(),
+            cem,
+            rate_limit: RateLimitStep::new(rate_limiter),
+            executor: OkxExecutorStep::new(trade_client),
+        }
+    }
+
     /// ลำเลียงคำสั่งเดี่ยวผ่านแต่ละ Step ใน Pipeline
     pub async fn process_action(
         &self,

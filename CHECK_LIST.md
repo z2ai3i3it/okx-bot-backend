@@ -334,56 +334,58 @@
       - ถ้า Planned (sibling cleanup): เคลียร์ `chasing_state = None` → finalize ปกติ
       - ถ้า Unplanned: เคลียร์ `chasing_state` เดิม → วาง order ใหม่ → ตั้ง `ChasingState` ใหม่
 
-  - [x] **8.4.5 OKX cancelSource Mapping**
-    - ใช้ field `cancelSource` จาก OKX Order WS event เพื่อแยก Planned vs Unplanned:
-      - `"0"` = order cancel by system → **Unplanned** (Heal ถ้า zero fill)
-      - `"1"` = user cancel → ตรวจสอบ `planned_cancel_order_ids` ถ้าใช่ planned ภายใน หรือ external user cancel → **ไม่ heal**
+  - [x] **8.4.5 OKX cancelSource Mapping & Legacy Alignment**
+    - แยก Planned vs Unplanned:
+      - **Planned Cancel** (อยู่ใน `planned_cancel_order_ids` เช่น Sibling Cleanup หรือ Bot สั่งยกเลิกตามแผน) → **ไม่ Heal**
+      - **Unplanned Cancel** (ไม่อยู่ใน `planned_cancel_order_ids` เช่น cancelSource="0" system cancel, "31" post-only, รวมถึง "1" ที่ user กดยกเลิกเองบนเว็บ Exchange) ถ้า zero-fill → **Self-Heal วาง Order ใหม่สวนกลับมาเสมอ (Legacy Behavior)**
     - 📄 รายละเอียดค่า cancelSource ทั้งหมดและการจัดกลุ่มดูที่ [OKX_CANCEL_SOURCE.md](./OKX_CANCEL_SOURCE.md)
 
   - [x] **8.4.6 Unit Test สำหรับ Unplanned Cancel Healing Cases**
     - `test_unplanned_cancel_zero_fill_heals_order_at_market` ผ่านเรียบร้อย
     - `test_planned_cancel_sibling_cleanup_does_not_heal` ผ่านเรียบร้อย
     - `test_unplanned_cancel_with_partial_fill_waits_and_cancels_sibling` ผ่านเรียบร้อย
-    - `test_external_user_cancel_source_1_finalizes_without_heal` ผ่านเรียบร้อย (41 tests passed)
+    - `test_external_user_cancel_source_1_triggers_self_heal` ผ่านเรียบร้อย (Legacy alignment)
 
-- [ ] **9. CEM Gatekeeper (Capital Efficiency Manager)**
+## Phase 9 CEM (Capital Efficiency Manager)
+
   - **Context:** 1 account → หลาย bot → หลาย pair → ต้อง share capital ข้าม bot
   - **Legacy Ref:** [capital_efficiency_manager.py](./logs/capital_efficiency_manager.py), [cem_simulate_cancel_plan.py](./logs/cem_simulate_cancel_plan.py)
   - **Analysis:** [cem_analysis.md](CEM Analysis Artifact)
 
-  - [ ] **9.1 Balance Snapshot + Virtual Lock**
-    - [ ] สร้าง `BalanceManager` struct: `HashMap<String, BalanceEntry>` (free/used/total per asset)
+  - [x] **9.1 Balance Snapshot + Virtual Lock**
+    - [x] สร้าง `BalanceManager` / `CemManager` struct: `HashMap<String, AssetBalance>` (free/used/total per asset)
     - [ ] Subscribe OKX WS `account` channel เพื่อรับ balance update real-time
-    - [ ] Virtual Lock: เมื่อ approve intent → หัก `free`, เพิ่ม `used`
-    - [ ] Virtual Unlock: เมื่อ cancel/fill/reject → คืน `used` กลับ `free`
-    - [ ] Re-apply locks เมื่อ WS balance update มาใหม่ (ป้องกัน ground-truth override virtual state)
+    - [x] Virtual Lock: เมื่อ approve intent → หัก `free`, เพิ่ม `used`
+    - [x] Virtual Unlock: เมื่อ cancel/fill/reject → คืน `used` กลับ `free`
+    - [x] Re-apply locks เมื่อ WS balance update มาใหม่ (ป้องกัน ground-truth override virtual state)
     - Legacy ref: `_check_and_approve_fast()` L625-665, `_release_capital()` L338-364, `_process_balance_update()` L413-443
 
-  - [ ] **9.2 CEM Gate — Approve / Reject**
-    - [ ] แปลง `CemStep` จาก pass-through เป็น real gate
-    - [ ] Logic: `if balance.free >= estimated_cost → approve, else → trigger cancel plan or park`
-    - [ ] CEM ต้องเป็น shared state ข้าม bot (Arc<Mutex<CEM>>) เพราะ 1 account ใช้ร่วมกัน
-    - [ ] PlaceOrder: ต้อง estimate cost (amount × price สำหรับ buy, amount สำหรับ sell)
-    - [ ] AmendOrder: คำนวณ cost diff (ถ้าราคาเปลี่ยน cost อาจเพิ่ม/ลด)
-    - [ ] CancelOrder: ปล่อยผ่านเสมอ (cancel ไม่ใช้ capital เพิ่ม)
+  - [x] **9.2 CEM Gate — Approve / Reject**
+    - [x] แปลง `CemStep` จาก pass-through เป็น real gate
+    - [x] Logic: `if balance.free >= estimated_cost → approve, else → trigger cancel plan or park`
+    - [x] CEM เป็น shared state ข้าม bot (Arc<CemManager>) เพื่อให้ 1 account ใช้ร่วมกันได้
+    - [x] PlaceOrder: estimate cost (amount × price สำหรับ buy, amount สำหรับ sell)
+    - [x] AmendOrder: ปล่อยผ่าน (เตรียมคำนวณ cost diff)
+    - [x] CancelOrder: ปล่อยผ่านเสมอ (cancel ไม่ใช้ capital เพิ่ม)
     - Legacy ref: `_process_order_intent()` L370-382
 
-  - [ ] **9.3 Cancel Plan (simulate_cancel_plan)**
-    - [ ] Port `simulate_cancel_plan()` เป็น Rust pure function
-    - [ ] Price Conversion: แปลงราคาทุก order เป็น BTC/USDT scale เพื่อเปรียบเทียบข้าม pair
+  - [x] **9.3 Cancel Plan (simulate_cancel_plan)**
+    - [x] Port `simulate_cancel_plan()` เป็น Rust pure function ใน [simulate_cancel_plan.rs](file:///c:/Users/z2ai3/Documents/GitHub/okx-web-bot/okx-bot-backend/src/pipeline/simulate_cancel_plan.rs)
+    - [x] Price Conversion: แปลงราคาทุก order เป็น BTC/USDT scale เพื่อเปรียบเทียบข้าม pair
       - Case 1: `BTC/USDT` → ไม่แปลง
       - Case 2: `XXX/BTC` → `mid_xxxusdt / order_price`
       - Case 3: `XXX/USDT` → `(order_price / mid_xxxusdt) * mid_btcusdt`
       - Case 4: `XXX/YYY` → via USDT intermediary
-    - [ ] Distance Score: `abs(converted_price - mid_btcusdt)` → ไกล = cancel ก่อน, ใกล้ = เก็บไว้
-    - [ ] Algorithm: cumulative cancel จาก furthest จนกว่า `freed >= deficit`
-    - [ ] Smart Parking: ถ้า `freed > deficit` → ใช้ surplus เก็บ order ที่ใกล้ mid ที่สุดไว้
-    - [ ] Fallback: ถ้าไม่มี mid price → ใช้ simple priority-based plan
+    - [x] Distance Score: `abs(converted_price - mid_btcusdt)` → ไกล = cancel ก่อน, ใกล้ = เก็บไว้
+    - [x] Algorithm: cumulative cancel จาก furthest จนกว่า `freed >= deficit`
+    - [x] Smart Parking: ถ้า `freed > deficit` → ใช้ surplus เก็บ order ที่ใกล้ mid ที่สุดไว้
+    - [x] Fallback: ถ้าไม่มี mid price → ใช้ simple priority-based plan
     - Legacy ref: `simulate_cancel_plan()` ทั้งไฟล์, `_simulate_and_handle_plan()` L667-759
 
-  - [ ] **9.4 Tracked Orders Pool**
-    - [ ] `HashMap<String, TrackedOrder>` — เก็บ intent ทุกตัวที่ CEM รับรู้
-    - [ ] IntentStatus: `Approved → Submitted → Open → Closed/Canceled/Rejected` + `Parked` + `CancelPending`
+  - [x] **9.4 Tracked Orders Pool**
+    - [x] `HashMap<String, TrackedOrderForCem>` — เก็บ intent ทุกตัวที่ CEM รับรู้ (Fast-path approved order ถูกบันทึกลง pool อัตโนมัติ)
+    - [x] Intent Tracking & Retrieval (`track_order`, `untrack_order`, `get_all_tracked_orders`)
+    - [ ] IntentStatus ละเอียด (`Approved → Submitted → Open → Closed/Canceled/Rejected` + `Parked` + `CancelPending`)
     - [ ] Heartbeat cleanup: ลบ terminal states หลัง cooldown (60s)
     - Legacy ref: `tracked_orders` dict, `_process_exchange_event()` L445-513
 
@@ -395,15 +397,15 @@
     - Legacy ref: `_reevaluate_parked_orders()` L837-901
 
   - [ ] **9.6 Integration with Pipeline & Strategy**
-    - [ ] CEM เป็น shared resource ใน `OrderPipeline` → inject via `Arc<CemManager>`
-    - [ ] Strategy ส่ง `StrategyAction` → Pipeline → CEM gate → approve/reject/park
+    - [x] CEM เป็น shared resource ใน `OrderPipeline` → inject via `OrderPipeline::with_cem` พร้อม `Arc<CemManager>`
+    - [x] Strategy ส่ง `StrategyAction` → Pipeline → CEM gate → approve (lock & track) / reject (cancel plan)
     - [ ] เมื่อ reject: pipeline return `Err` → strategy จัดการ (อิง legacy: park + reevaluate)
     - [ ] เมื่อ exchange event (fill/cancel) → notify CEM เพื่อ unlock capital + reevaluate parked
 
-  - [ ] **9.7 Unit Tests**
-    - [ ] Balance virtual lock/unlock
-    - [ ] Approve fast path (เงินพอ)
-    - [ ] Cancel plan generation (เงินไม่พอ → cancel ตัวไกล)
-    - [ ] Smart parking (surplus → เก็บตัวใกล้)
+  - [x] **9.7 Unit Tests**
+    - [x] Balance virtual lock/unlock
+    - [x] Approve fast path (เงินพอ)
+    - [x] Cancel plan generation (เงินไม่พอ → cancel ตัวไกล)
+    - [x] Smart parking (surplus → เก็บตัวใกล้)
     - [ ] Parked order reevaluation (balance เปลี่ยน → reactivate)
     - [ ] Multi-bot competition (2 bot แย่ง capital asset เดียวกัน)

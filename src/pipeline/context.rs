@@ -21,6 +21,7 @@ pub struct PipelineContext {
     pub op_type: OrderOpType,
     pub action: StrategyAction,
     pub status: PipelineStatus,
+    pub cancel_plan: Option<crate::pipeline::simulate_cancel_plan::CancelPlanResult>,
 }
 
 impl PipelineContext {
@@ -65,6 +66,7 @@ impl PipelineContext {
             op_type,
             action,
             status: PipelineStatus::Pending,
+            cancel_plan: None,
         })
     }
 

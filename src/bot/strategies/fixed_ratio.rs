@@ -10,7 +10,8 @@ use crate::{
     bot::{
         math::fixed_ratio_cal::{
             RebalanceRecord, TargetAnchorOrder, cal_target_amount_improved, cal_target_price,
-            generate_cl_ord_id, roundup, save_to_db_filled_rebalance, save_to_db_first_filled_rebalance,
+            generate_cl_ord_id, roundup, save_to_db_filled_rebalance,
+            save_to_db_first_filled_rebalance,
         },
         strategies::base::{Strategy, StrategyAction, StrategyRecoveryFuture},
     },
@@ -410,7 +411,11 @@ impl FixedRatioStrategy {
         if is_sell {
             self.tracked_sell = None;
         }
-        if self.chasing_state.as_ref().map_or(false, |c| c.client_order_id == cl_ord_id) {
+        if self
+            .chasing_state
+            .as_ref()
+            .map_or(false, |c| c.client_order_id == cl_ord_id)
+        {
             self.chasing_state = None;
         }
 
@@ -966,7 +971,8 @@ impl Strategy for FixedRatioStrategy {
                             self.bot_id,
                             buy_order.cl_ord_id
                         );
-                        self.planned_cancel_order_ids.insert(buy_order.cl_ord_id.clone());
+                        self.planned_cancel_order_ids
+                            .insert(buy_order.cl_ord_id.clone());
                         actions.push(StrategyAction::CancelOrder(WsCancelOrderArg {
                             inst_id: self.pair.clone(),
                             inst_id_code,
@@ -982,7 +988,8 @@ impl Strategy for FixedRatioStrategy {
                             self.bot_id,
                             sell_order.cl_ord_id
                         );
-                        self.planned_cancel_order_ids.insert(sell_order.cl_ord_id.clone());
+                        self.planned_cancel_order_ids
+                            .insert(sell_order.cl_ord_id.clone());
                         actions.push(StrategyAction::CancelOrder(WsCancelOrderArg {
                             inst_id: self.pair.clone(),
                             inst_id_code,
@@ -1065,7 +1072,8 @@ impl Strategy for FixedRatioStrategy {
                                 self.bot_id,
                                 buy_order.cl_ord_id
                             );
-                            self.planned_cancel_order_ids.insert(buy_order.cl_ord_id.clone());
+                            self.planned_cancel_order_ids
+                                .insert(buy_order.cl_ord_id.clone());
                             actions.push(StrategyAction::CancelOrder(WsCancelOrderArg {
                                 inst_id: self.pair.clone(),
                                 inst_id_code,
@@ -1081,7 +1089,8 @@ impl Strategy for FixedRatioStrategy {
                                 self.bot_id,
                                 sell_order.cl_ord_id
                             );
-                            self.planned_cancel_order_ids.insert(sell_order.cl_ord_id.clone());
+                            self.planned_cancel_order_ids
+                                .insert(sell_order.cl_ord_id.clone());
                             actions.push(StrategyAction::CancelOrder(WsCancelOrderArg {
                                 inst_id: self.pair.clone(),
                                 inst_id_code,
@@ -1098,7 +1107,11 @@ impl Strategy for FixedRatioStrategy {
                     let is_planned = self.planned_cancel_order_ids.contains(cl_ord_id);
 
                     // 8.3.2 Insufficient Funds (51010/51015 / cancelSource 9, 44): ไม่ heal
-                    if s_code == "51010" || s_code == "51015" || cancel_source == "9" || cancel_source == "44" {
+                    if s_code == "51010"
+                        || s_code == "51015"
+                        || cancel_source == "9"
+                        || cancel_source == "44"
+                    {
                         log::warn!(
                             "[Bot #{}] ⚠️ Order canceled due to Insufficient Funds (code={}, cancelSource={}): clOrdId={}. Skipping healing, finalizing order.",
                             self.bot_id,
@@ -1119,23 +1132,27 @@ impl Strategy for FixedRatioStrategy {
                         let finalize_actions = self.try_finalize_order(cl_ord_id, ord_id);
                         actions.extend(finalize_actions);
                     }
-                    // User Cancel จากภายนอก (cancelSource == "1" ที่ไม่ได้อยู่ใน planned_cancel_order_ids): ไม่ heal
-                    else if cancel_source == "1" {
-                        log::info!(
-                            "[Bot #{}] 👤 [External User Cancel] Order {} cancelled by user (cancelSource=1). Finalizing without heal.",
-                            self.bot_id,
-                            cl_ord_id
-                        );
-                        let finalize_actions = self.try_finalize_order(cl_ord_id, ord_id);
-                        actions.extend(finalize_actions);
-                    }
-                    // 8.4.1 Unplanned Cancel (Zero Fill) & 8.3.1 Post-Only Rejection:
-                    // Trigger: cancelSource == "0" (system cancel) หรือ "31" (post-only) หรือ sCode != "0" โดยที่ fill_sz == 0
-                    else if (cancel_source == "0" || cancel_source == "31" || (s_code != "0" && !s_code.is_empty() && s_code != "50011"))
-                        && fill_sz == Decimal::ZERO
-                    {
+                    // // User Cancel จากภายนอก (cancelSource == "1" ที่ไม่ได้อยู่ใน planned_cancel_order_ids): ไม่ heal
+                    // else if cancel_source == "1" {
+                    //     log::info!(
+                    //         "[Bot #{}] 👤 [External User Cancel] Order {} cancelled by user (cancelSource=1). Finalizing without heal.",
+                    //         self.bot_id,
+                    //         cl_ord_id
+                    //     );
+                    //     let finalize_actions = self.try_finalize_order(cl_ord_id, ord_id);
+                    //     actions.extend(finalize_actions);
+                    // }
+                    // // 8.4.1 Unplanned Cancel (Zero Fill) & 8.3.1 Post-Only Rejection:
+                    // // Trigger: cancelSource == "0" (system cancel) หรือ "31" (post-only) หรือ sCode != "0" โดยที่ fill_sz == 0
+                    // else if (cancel_source == "0" || cancel_source == "31" || (s_code != "0" && !s_code.is_empty() && s_code != "50011"))
+                    //     && fill_sz == Decimal::ZERO
+                    // {
+
+                    // 8.4.1 Unplanned Cancel (Zero Fill) & External Cancel:
+                    // ถ้าไม่อยู่ใน planned_cancel_order_ids และไม่มี fill -> Self-Heal สวนกลับมาเสมอ (แบบ Legacy)
+                    else if fill_sz == Decimal::ZERO {
                         log::warn!(
-                            "[Bot #{}] 🩹 [8.4.1 Unplanned Cancel Healing] Order cancelled by system (cancelSource={}, sCode={}): clOrdId={}. Re-placing at market (100 ticks offset)...",
+                            "[Bot #{}] 🩹 [8.4.1 Unplanned Cancel Healing] Order cancelled (cancelSource={}, sCode={}): clOrdId={}. Re-placing at market (100 ticks offset)...",
                             self.bot_id,
                             cancel_source,
                             s_code,
@@ -1143,14 +1160,26 @@ impl Strategy for FixedRatioStrategy {
                         );
 
                         // 8.4.4 ถ้ากำลัง Chasing อยู่ ให้เคลียร์ chasing_state เดิมออกเพื่อกัน race condition
-                        if self.chasing_state.as_ref().map_or(false, |c| &c.client_order_id == cl_ord_id) {
+                        if self
+                            .chasing_state
+                            .as_ref()
+                            .map_or(false, |c| &c.client_order_id == cl_ord_id)
+                        {
                             self.chasing_state = None;
                         }
 
                         // ดึงข้อมูลเดิมจาก tracked order
-                        let old_order = if self.tracked_buy.as_ref().map_or(false, |o| &o.cl_ord_id == cl_ord_id) {
+                        let old_order = if self
+                            .tracked_buy
+                            .as_ref()
+                            .map_or(false, |o| &o.cl_ord_id == cl_ord_id)
+                        {
                             self.tracked_buy.take()
-                        } else if self.tracked_sell.as_ref().map_or(false, |o| &o.cl_ord_id == cl_ord_id) {
+                        } else if self
+                            .tracked_sell
+                            .as_ref()
+                            .map_or(false, |o| &o.cl_ord_id == cl_ord_id)
+                        {
                             self.tracked_sell.take()
                         } else {
                             None
@@ -1894,9 +1923,9 @@ mod tests {
         assert_eq!(chasing.side, Side::Sell);
         assert_eq!(chasing.current_price, dec!(60010.0)); // 60000 + 10
 
-        // 2. จำลองเวลาผ่านไปเพื่อผ่าน throttle (ปรับ last_amend_time ย้อนหลัง 1 วินาที)
+        // 2. จำลองเวลาผ่านไปเพื่อผ่าน throttle 5000ms (ปรับ last_amend_time ย้อนหลัง 6 วินาที)
         strategy.chasing_state.as_mut().unwrap().last_amend_time =
-            Instant::now() - Duration::from_secs(1);
+            Instant::now() - Duration::from_secs(6);
 
         // Ticker ตัวถัดไป: spread = 60005 - 59995 = 10 (>= 3 ticks = 0.3)
         // ฝั่ง Sell จะแทรกกลาง: ask1 - 1 tick = 60005.0 - 0.1 = 60004.9
@@ -1951,7 +1980,9 @@ mod tests {
         };
 
         // จำลอง trade fill มาก่อนเพื่อพร้อม finalize
-        strategy.cumulative_filled.insert(cl_ord_id.clone(), dec!(0.0166));
+        strategy
+            .cumulative_filled
+            .insert(cl_ord_id.clone(), dec!(0.0166));
         strategy.on_order_update(&update);
 
         assert!(
@@ -1984,7 +2015,12 @@ mod tests {
 
         let actions = strategy.on_ticker(&ticker);
         assert_eq!(actions.len(), 1);
-        let orig_cl_ord_id = strategy.chasing_state.as_ref().unwrap().client_order_id.clone();
+        let orig_cl_ord_id = strategy
+            .chasing_state
+            .as_ref()
+            .unwrap()
+            .client_order_id
+            .clone();
         let orig_amount = strategy.tracked_sell.as_ref().unwrap().amount;
 
         // 2. จำลอง OKX ส่ง canceled กลับมาพร้อม cancelSource="31" (Post-only will cross liquidity)
@@ -2004,7 +2040,11 @@ mod tests {
         };
 
         let heal_actions = strategy.on_order_update(&cancel_event);
-        assert_eq!(heal_actions.len(), 1, "ต้อง emit PlaceOrder ใหม่เพื่อ Self-Healing");
+        assert_eq!(
+            heal_actions.len(),
+            1,
+            "ต้อง emit PlaceOrder ใหม่เพื่อ Self-Healing"
+        );
 
         if let StrategyAction::PlaceOrder { arg, .. } = &heal_actions[0] {
             assert_eq!(arg.side, "sell");
@@ -2014,7 +2054,10 @@ mod tests {
             assert_ne!(new_cl_ord_id, &orig_cl_ord_id, "clOrdId ใหม่ต้องไม่ซ้ำกับอันเดิม");
 
             // ตรวจสอบว่า chasing_state ถูกผูกเข้ากับคำสั่งใหม่
-            let new_chasing = strategy.chasing_state.as_ref().expect("ต้องมี chasing_state ใหม่");
+            let new_chasing = strategy
+                .chasing_state
+                .as_ref()
+                .expect("ต้องมี chasing_state ใหม่");
             assert_eq!(&new_chasing.client_order_id, new_cl_ord_id);
             assert_eq!(new_chasing.side, Side::Sell);
         } else {
@@ -2046,7 +2089,12 @@ mod tests {
 
         let actions = strategy.on_ticker(&ticker);
         assert_eq!(actions.len(), 1);
-        let orig_cl_ord_id = strategy.chasing_state.as_ref().unwrap().client_order_id.clone();
+        let orig_cl_ord_id = strategy
+            .chasing_state
+            .as_ref()
+            .unwrap()
+            .client_order_id
+            .clone();
 
         // 2. จำลอง OKX cancel ด้วยสาเหตุเงินไม่พอ (code=51010)
         let cancel_event = OkxOrderUpdateData {
@@ -2066,10 +2114,7 @@ mod tests {
 
         let _actions = strategy.on_order_update(&cancel_event);
         // ไม่มีการ heal (ไม่มี PlaceOrder action ที่สร้างคำสั่งใหม่เพื่อ heal)
-        assert!(
-            strategy.tracked_sell.is_none(),
-            "tracked_sell ต้องถูกล้างออก"
-        );
+        assert!(strategy.tracked_sell.is_none(), "tracked_sell ต้องถูกล้างออก");
         assert!(
             strategy.chasing_state.is_none(),
             "chasing_state ต้องถูกล้างออก"
@@ -2100,7 +2145,12 @@ mod tests {
 
         let actions = strategy.on_ticker(&ticker);
         assert_eq!(actions.len(), 1);
-        let orig_cl_ord_id = strategy.chasing_state.as_ref().unwrap().client_order_id.clone();
+        let orig_cl_ord_id = strategy
+            .chasing_state
+            .as_ref()
+            .unwrap()
+            .client_order_id
+            .clone();
         let orig_amount = strategy.tracked_sell.as_ref().unwrap().amount;
 
         // 2. OKX system cancels order (cancelSource = "0", zero fill) -> 8.4.1 Unplanned Cancel
@@ -2120,7 +2170,11 @@ mod tests {
         };
 
         let heal_actions = strategy.on_order_update(&cancel_event);
-        assert_eq!(heal_actions.len(), 1, "8.4.1: ต้อง emit PlaceOrder ใหม่เพื่อ Self-Heal");
+        assert_eq!(
+            heal_actions.len(),
+            1,
+            "8.4.1: ต้อง emit PlaceOrder ใหม่เพื่อ Self-Heal"
+        );
 
         if let StrategyAction::PlaceOrder { arg, .. } = &heal_actions[0] {
             assert_eq!(arg.side, "sell");
@@ -2131,8 +2185,14 @@ mod tests {
                 "ต้องได้ clOrdId ใหม่"
             );
             // 8.4.4 Chasing state ต้องถูกย้ายไปผูกกับออเดอร์ใหม่
-            let new_chasing = strategy.chasing_state.as_ref().expect("ต้องมี ChasingState ใหม่");
-            assert_eq!(&new_chasing.client_order_id, arg.client_order_id.as_ref().unwrap());
+            let new_chasing = strategy
+                .chasing_state
+                .as_ref()
+                .expect("ต้องมี ChasingState ใหม่");
+            assert_eq!(
+                &new_chasing.client_order_id,
+                arg.client_order_id.as_ref().unwrap()
+            );
         } else {
             panic!("Expected PlaceOrder action");
         }
@@ -2173,7 +2233,9 @@ mod tests {
             acc_fill_size: "0.01".to_string(),
             ..Default::default()
         };
-        strategy.cumulative_filled.insert("buy-ord-1".to_string(), dec!(0.01));
+        strategy
+            .cumulative_filled
+            .insert("buy-ord-1".to_string(), dec!(0.01));
 
         let actions = strategy.on_order_update(&fill_update);
         assert_eq!(actions.len(), 1);
@@ -2197,10 +2259,18 @@ mod tests {
 
         let cancel_actions = strategy.on_order_update(&cancel_update);
         // ตรวจสอบว่าไม่มีการ heal (ไม่มีคำสั่ง PlaceOrder เกิดขึ้น)
-        let has_place_order = cancel_actions.iter().any(|a| matches!(a, StrategyAction::PlaceOrder { .. }));
-        assert!(!has_place_order, "8.4.3: Planned cancel ห้ามวาง order ใหม่ (ห้าม heal)");
+        let has_place_order = cancel_actions
+            .iter()
+            .any(|a| matches!(a, StrategyAction::PlaceOrder { .. }));
+        assert!(
+            !has_place_order,
+            "8.4.3: Planned cancel ห้ามวาง order ใหม่ (ห้าม heal)"
+        );
         assert!(strategy.tracked_sell.is_none(), "tracked_sell ต้องถูกล้างออก");
-        assert!(!strategy.planned_cancel_order_ids.contains("sell-ord-1"), "ต้องล้าง planned set ออก");
+        assert!(
+            !strategy.planned_cancel_order_ids.contains("sell-ord-1"),
+            "ต้องล้าง planned set ออก"
+        );
     }
 
     #[test]
@@ -2253,10 +2323,13 @@ mod tests {
     }
 
     #[test]
-    fn test_external_user_cancel_source_1_finalizes_without_heal() {
+    fn test_external_user_cancel_source_1_triggers_self_heal() {
         let config = mock_config();
-        let mut strategy =
-            FixedRatioStrategy::new("bot-user-cancel".to_string(), "BTC-USDT".to_string(), config);
+        let mut strategy = FixedRatioStrategy::new(
+            "bot-user-cancel".to_string(),
+            "BTC-USDT".to_string(),
+            config,
+        );
 
         let buy_order = TrackedOrder {
             cl_ord_id: "buy-external-1".to_string(),
@@ -2266,7 +2339,7 @@ mod tests {
         };
         strategy.tracked_buy = Some(buy_order);
 
-        // ผู้ใช้กดยกเลิกเองบน Web / App ของ OKX (cancelSource = "1")
+        // ผู้ใช้กดยกเลิกเองบน Web / App ของ OKX (cancelSource = "1") แต่ไม่อยู่ใน planned_cancel_order_ids
         let cancel_event = OkxOrderUpdateData {
             inst_id: "BTC-USDT".to_string(),
             order_id: "ord-ext-1".to_string(),
@@ -2282,9 +2355,21 @@ mod tests {
         };
 
         let actions = strategy.on_order_update(&cancel_event);
-        // ห้าม heal
-        let has_place_order = actions.iter().any(|a| matches!(a, StrategyAction::PlaceOrder { .. }));
-        assert!(!has_place_order, "User cancel (cancelSource=1) ต้องไม่ heal");
-        assert!(strategy.tracked_buy.is_none(), "tracked_buy ต้องถูกล้างออก");
+        // แบบ Legacy: ต้อง Self-Heal สวนกลับมา
+        let has_place_order = actions
+            .iter()
+            .any(|a| matches!(a, StrategyAction::PlaceOrder { .. }));
+        assert!(
+            has_place_order,
+            "User cancel (cancelSource=1) ต้อง Self-Heal สวนกลับมาแบบ Legacy"
+        );
+        assert!(
+            strategy.tracked_buy.is_some(),
+            "tracked_buy ต้องมีตัวใหม่ที่ถูก heal"
+        );
+        assert!(
+            strategy.chasing_state.is_some(),
+            "ต้องตั้ง chasing state สำหรับ order ที่ heal"
+        );
     }
 }
