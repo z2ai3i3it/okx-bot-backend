@@ -354,7 +354,7 @@
 
   - [x] **9.1 Balance Snapshot + Virtual Lock**
     - [x] สร้าง `BalanceManager` / `CemManager` struct: `HashMap<String, AssetBalance>` (free/used/total per asset)
-    - [ ] Subscribe OKX WS `account` channel เพื่อรับ balance update real-time
+    - [x] Subscribe OKX WS `account` channel เพื่อรับ balance update real-time ใน `BotExecutor`
     - [x] Virtual Lock: เมื่อ approve intent → หัก `free`, เพิ่ม `used`
     - [x] Virtual Unlock: เมื่อ cancel/fill/reject → คืน `used` กลับ `free`
     - [x] Re-apply locks เมื่อ WS balance update มาใหม่ (ป้องกัน ground-truth override virtual state)
@@ -385,27 +385,84 @@
   - [x] **9.4 Tracked Orders Pool**
     - [x] `HashMap<String, TrackedOrderForCem>` — เก็บ intent ทุกตัวที่ CEM รับรู้ (Fast-path approved order ถูกบันทึกลง pool อัตโนมัติ)
     - [x] Intent Tracking & Retrieval (`track_order`, `untrack_order`, `get_all_tracked_orders`)
-    - [ ] IntentStatus ละเอียด (`Approved → Submitted → Open → Closed/Canceled/Rejected` + `Parked` + `CancelPending`)
+    - [x] IntentStatus ละเอียด (`Approved`, `Parked`, `CancelPending`)
     - [ ] Heartbeat cleanup: ลบ terminal states หลัง cooldown (60s)
     - Legacy ref: `tracked_orders` dict, `_process_exchange_event()` L445-513
 
-  - [ ] **9.5 Parked Orders & Reevaluation**
-    - [ ] เมื่อ intent ถูก park → เก็บไว้ใน pool พร้อม `cem_priority` (distance score)
-    - [ ] เมื่อ balance เปลี่ยน (cancel สำเร็จ, fill สำเร็จ) → trigger `reevaluate_parked_orders()`
-    - [ ] Sort parked orders by `(cem_priority, -created_at)` → reactivate ตัวที่ใกล้ mid สุดก่อน
-    - [ ] เมื่อ reactivate: re-lock capital + emit approval
+  - [x] **9.5 Parked Orders & Reevaluation**
+    - [x] เมื่อ intent ถูก park → เก็บไว้ใน pool พร้อม `cem_priority` (distance score) และ `status: IntentStatus::Parked`
+    - [x] เมื่อ balance เปลี่ยน (cancel สำเร็จ, fill สำเร็จ, หรือ balance WS update) → trigger `reevaluate_parked_orders()`
+    - [x] Sort parked orders by `(cem_priority, -created_at)` → reactivate ตัวที่ใกล้ mid สุดก่อน
+    - [x] เมื่อ reactivate: re-lock capital + ปลุก Strategy ผ่าน `on_cem_reactivate`
     - Legacy ref: `_reevaluate_parked_orders()` L837-901
 
-  - [ ] **9.6 Integration with Pipeline & Strategy**
-    - [x] CEM เป็น shared resource ใน `OrderPipeline` → inject via `OrderPipeline::with_cem` พร้อม `Arc<CemManager>`
-    - [x] Strategy ส่ง `StrategyAction` → Pipeline → CEM gate → approve (lock & track) / reject (cancel plan)
-    - [ ] เมื่อ reject: pipeline return `Err` → strategy จัดการ (อิง legacy: park + reevaluate)
-    - [ ] เมื่อ exchange event (fill/cancel) → notify CEM เพื่อ unlock capital + reevaluate parked
+  - [x] **9.6 Integration with Pipeline & Strategy**
+    - [x] CEM เป็น shared resource ใน `OrderPipeline` → inject via `OrderPipeline::with_cem` พร้อม `Arc<CemManager>` (1 Instance ต่อ Account ใน `BotManager`)
+    - [x] Strategy ส่ง `StrategyAction` → Pipeline → CEM gate → approve (lock & track) / reject (cancel plan + park intent)
+    - [x] เมื่อ reject: เก็บ intent เป็น Parked ใน CEM pool ไม่ให้ข้อมูลหลุดหาย
+    - [x] เมื่อ exchange event (fill/cancel) → notify CEM เพื่อ unlock capital + reevaluate parked
+    - [x] เมื่อ balance WS update → อัปเดต CEM balance + reevaluate parked
 
   - [x] **9.7 Unit Tests**
     - [x] Balance virtual lock/unlock
     - [x] Approve fast path (เงินพอ)
     - [x] Cancel plan generation (เงินไม่พอ → cancel ตัวไกล)
     - [x] Smart parking (surplus → เก็บตัวใกล้)
-    - [ ] Parked order reevaluation (balance เปลี่ยน → reactivate)
+    - [x] Parked order reevaluation (balance เปลี่ยน → reactivate)
     - [ ] Multi-bot competition (2 bot แย่ง capital asset เดียวกัน)
+
+## Phase 10 CEM Full-Loop Execution & Strategy Parked State Lifecycle
+
+  - **Context:** ถอดแบบพฤติกรรมจาก `logs/rqm.log` (L99-144, L290-336) เพื่อให้วงจรการแย่งชิงเงินทุน (Preemption), การสั่ง Cancel ออเดอร์ตัวไกล, การถือ State ใน Strategy และการปลุกคำสั่งกลับมาวางใหม่ ทำงานปะติดปะต่อกัน 100%
+  - **Reference:** `logs/rqm.log`, `logs/capital_efficiency_manager.py`
+
+  - [x] **10.1 Active vs Parked State Separation ใน Strategy (`FixedRatioStrategy`)**
+    - [x] เพิ่มฟิลด์ `parked_buy: Option<TrackedOrder>` และ `parked_sell: Option<TrackedOrder>`
+    - [x] เมื่อ Action ถูกปฏิเสธ/พาร์กจาก CEM (`on_action_failed`):
+      - ย้ายคำสั่งจาก `tracked_buy/sell` ไปเก็บใน `parked_buy/sell` แทนการตั้งเป็น `None` ทิ้ง
+      - ป้องกัน `pending_cancel_orders()` ส่ง Cancel คำสั่งลมไปให้ OKX ด่า Error `51400` ตอน Stop Bot
+    - [x] เมื่อได้รับสัญญาณปลุกจาก CEM (`on_cem_reactivate`):
+      - ตรวจสอบ `intent_id` เทียบกับ `parked_buy/sell`
+      - ย้ายกลับมาเป็น `tracked_buy/sell` และส่งคำสั่ง `PlaceOrder` ออกไปวางบนกระดานใหม่ทันที
+
+  - [x] **10.2 Dispatching Cancel Plan สำหรับออเดอร์ตัวไกล (`CemStep` / Execution Gate)**
+    - [x] ใน `CemStep.execute()` เมื่อเกิด Deficit แล้ว `plan.can_approve_intent == true` และมี `plan.orders_to_cancel`:
+      - ไม่ใช่แค่คืน `Err` แล้วจบ แต่ต้องมีกลไกส่งคำสั่ง `CancelOrder` สำหรับทุก ID ใน `orders_to_cancel` ไปยังกระดาน OKX จริงทันที
+      - บันทึกสถานะคำสั่งที่ถูกสั่ง Cancel เป็น `IntentStatus::CancelPending` ใน CEM Pool
+
+  - [x] **10.3 Planned Preemption Cancel Handling (บอทเจ้าของออเดอร์ตัวไกล)**
+    - [x] เมื่อบอทเจ้าของออเดอร์ตัวไกลได้รับ Event `order.state == "canceled"` จาก Exchange:
+      - ตรวจสอบว่าเป็น Planned Preemption Cancel จาก CEM (ไม่ได้เกิดจาก User หรือ Error)
+      - ไม่ทำ Unplanned Self-Heal สวนกลับมา
+      - ย้ายออเดอร์ของตัวเองไปอยู่ในสถานะ `parked_buy/sell` (แบบเดียวกับ `rqm.log` L115, L309)
+
+  - [x] **10.4 Auto-Reactivation & Order Re-placement (บอทตัวใกล้ที่รอเงิน)**
+    - [x] เมื่อ Cancel ออเดอร์ตัวไกลเสร็จสิ้น → OKX ส่งยืนยัน → `release_capital` คืนเงินเข้า CEM Pool
+    - [x] CEM รัน `reevaluate_parked_orders()` ทันที → ปลุกบอทตัวใกล้ที่จอดรอเงินอยู่
+    - [x] บอทตัวใกล้ได้รับ `on_cem_reactivate()` → ยิงคำสั่ง `PlaceOrder` ขึ้นกระดานแทนที่ออเดอร์ตัวไกลที่ถูกปลดออกไปอย่างราบรื่น
+
+  - [x] **10.5 Integration Test / Multi-Bot Verification**
+    - [x] ทดสอบจำลอง Flow แบบใน `rqm.log`:
+      - เปิดบอท #3 (ใช้เงินส่วนแรกจนเต็ม)
+      - เปิดบอท #2 (ใกล้ตลาดกว่า แย่งเงิน #3) → #3 โดนแคนเซิลหลบให้ → #2 วางแทนสำเร็จ → #3 พาร์กรอ
+      - ตรวจสอบว่าไม่มีออเดอร์ใดสูญหาย และไม่มี Error `51400` ตอน Stop Bot
+
+  - [x] **10.6 Robust Preemption Reconciliation & Cancel All Handling (แนวทางแก้ไขตามสถาปัตยกรรมเดิม)**
+    - [x] **10.6.1 Preemption Cancel Ack & State Reconciliation (แก้ไขออเดอร์ค้าง Parked จาก Cancel 51400):**
+      - แก้ไข `ws_trade.rs` และ `executor.rs` ให้ปลดล็อค reservation ที่สถานะ `CancelPending` ใน CEM ให้กลับเป็น Free ทันทีเมื่อได้รับ ack cancel fail 51400 และเรียก `reevaluate_and_route()` เพื่อปลุกออเดอร์ Priority สูงกว่าที่รอเงินอยู่ให้ทำงานต่อได้ทันที
+    - [x] **10.6.2 Align Distance & Priority Calculation to Python Legacy 100% (BTC/USDT Scale):**
+      - ปรับปรุงการคำนวณ `cem_priority` ใน `cem_step.rs` ให้ใช้สูตรเดียวกันกับ Python Legacy: แปลงราคาผ่าน `convert_to_btcusdt_price` และหา distance เทียบกับ `mid_btcusdt` (`abs(conv_px - mid_btcusdt)`)
+      - อัปเดต `fallback_simple_plan` ใน `simulate_cancel_plan.rs` ให้เทียบเคียงบนสเกล BTC/USDT เดียวกันทั้งหมด ไม่ให้เกิด Scale Mismatch ระหว่าง 0.xx กับ 15,xxx จน drop orders เหลือ 0
+    - [x] **10.6.3 Strict Priority Allocation During Burst / Unplanned Cancels:**
+      - แก้ไขจังหวะการปลดล็อกเงินใน `executor.rs` ให้ปลดล็อกคืน CEM ทันทีที่ออเดอร์ถึงสถานะ Terminal (Canceled) ก่อนหน้าที่ Strategy Engine จะเริ่มส่งคำสั่งวางใหม่ (Self-Healing)
+      - ป้องกันปัญหา Deficit หลอกและ Priority Inversion ตอนเกิด Cancel All บน Exchange ทำให้ออเดอร์ที่ Self-Heal ได้ทุนคืนและวางกลับคืนได้ครบถ้วนตามลำดับ
+
+  - [x] **10.7 Parked Order Auto-Preemption on Live Order Event (แก้ไขช่องว่างตอนออเดอร์ลำดับไกล Live ทีหลัง):**
+    - [x] **10.7.1 Preemption Phase in `reevaluate_parked_orders` (`cem_step.rs`):**
+      - เพิ่มตรรกะใน `reevaluate_parked_orders` ให้ไม่เพียงแค่รอเศษเงิน Free Balance แต่หากยังมี Parked Order ที่สำคัญกว่า (Priority 1) ค้างอยู่เพราะเงินไม่พอ ให้ทำการประเมิน `simulate_cancel_plan` กับออเดอร์ที่ `live_confirmed` บนกระดาน
+      - หากพบว่าสามารถ Preempt ออเดอร์ที่ Priority ด้อยกว่า (เช่น Bot #3) ได้ ให้สั่ง Cancel ไปยัง OKX ผ่าน `trade_client.cancel_order_ws` และตั้งสถานะเป็น `CancelPending` ทันที
+    - [x] **10.7.2 Trigger `reevaluate_and_route()` on Non-terminal (Live) Updates (`executor.rs`):**
+      - เพิ่มการเรียก `self.reevaluate_and_route().await` เมื่อได้รับ Event `state == "live"` จาก Exchange WebSocket (แบบเดียวกับ `_process_exchange_event` ใน Python Legacy)
+      - ทำให้เมื่อออเดอร์ตัวไกล (เช่น Bot #3) เพิ่งได้รับการยืนยันว่า Live บนกระดาน ระบบจะตรวจพบทันทีว่ามีออเดอร์ตัวใกล้ (Bot #2) ที่ Parked รออยู่ และส่งคำสั่ง Cancel Bot #3 เพื่อเคลียร์ทางให้ Bot #2 เข้ามาวางแทนทันที
+    - [x] **10.7.3 Unit Test Coverage (`cem_step.rs`):**
+      - เพิ่มเทสต์ `test_parked_order_triggers_preemption_when_new_order_becomes_live` ยืนยันว่าเมื่อ Bot #3 กลายเป็น Live ระบบจะทริกเกอร์ Preemption ให้ Bot #2 เข้ามาวางแทนได้อย่างสมบูรณ์แบบ

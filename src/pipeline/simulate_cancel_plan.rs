@@ -28,16 +28,43 @@ impl MidPrice {
     }
 }
 
+/// สถานะของ Intent ใน CEM Pool
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IntentStatus {
+    Approved,
+    Parked,
+    CancelPending,
+}
+
+impl Default for IntentStatus {
+    fn default() -> Self {
+        Self::Approved
+    }
+}
+
 /// ข้อมูล Order ที่อยู่ในระบบสำหรับนำมาประเมิน Cancel Plan
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackedOrderForCem {
     pub intent_id: String,
-    pub symbol: String, // e.g. "BTC-USDT" or "BTC/USDT"
+    pub symbol: String,         // e.g. "BTC-USDT" or "BTC/USDT"
     pub required_asset: String, // e.g. "USDT", "BTC"
     pub price: Decimal,
     pub locked_amount: Decimal,
     pub can_be_canceled: bool,
     pub cem_priority: Option<Decimal>,
+    #[serde(default)]
+    pub status: IntentStatus,
+    #[serde(default)]
+    pub bot_id: String,
+    #[serde(default)]
+    pub created_at: Option<i64>,
+    #[serde(default)]
+    pub inst_id_code: Option<u64>,
+    /// ยืนยันแล้วว่า order มีตัวตน live บน OKX จริง (มี order event สถานะ non-terminal เข้ามา)
+    /// ใช้คัดผู้ถูก preempt: ห้าม cancel plan เลือก order ที่ place ยังไม่ confirm
+    /// (cancel จะได้ 51400 "order does not exist" — เคสจริง zzz.log 03:00:00.637)
+    #[serde(default)]
+    pub live_confirmed: bool,
 }
 
 /// ข้อมูล Order Intent ที่ต้องการขอใช้เงินทุน
@@ -196,7 +223,12 @@ pub fn simulate_cancel_plan(
         Some(price) if *price > DEC_ZERO => *price,
         _ => {
             log::warn!("[CEM] Missing BTC/USDT mid price - falling back to simple plan");
-            return fallback_simple_plan(intent, current_free_balance, pending_orders, None);
+            return fallback_simple_plan(
+                intent,
+                current_free_balance,
+                pending_orders,
+                intent_distance_from_mid(intent, &mid_map),
+            );
         }
     };
 
@@ -206,14 +238,21 @@ pub fn simulate_cancel_plan(
         .map(|p| calculate_distance_from_mid(p, mid_btcusdt))
         .unwrap_or(DEC_ZERO);
 
-    // Step 1: Filter relevant orders (same required_asset & can_be_canceled)
+    // Step 1: Filter relevant orders (same required_asset & can_be_canceled & status == Approved)
     let relevant_orders: Vec<&TrackedOrderForCem> = pending_orders
         .iter()
-        .filter(|o| o.required_asset.eq_ignore_ascii_case(required_asset) && o.can_be_canceled)
+        .filter(|o| {
+            o.required_asset.eq_ignore_ascii_case(required_asset)
+                && o.can_be_canceled
+                && o.status == IntentStatus::Approved
+        })
         .collect();
 
     if relevant_orders.is_empty() {
-        log::warn!("[CEM] No cancelable orders found for asset {}", required_asset);
+        log::warn!(
+            "[CEM] No cancelable orders found for asset {}",
+            required_asset
+        );
         return CancelPlanResult {
             can_approve_intent: false,
             intent_distance: distance_intent,
@@ -265,13 +304,24 @@ pub fn simulate_cancel_plan(
         );
     }
 
+    // legacy แต่ยังไม่ยืนยันว่าถูกหรือผิด
     // Step 3: Sort by converted_price ascending (closest to mid first)
-    orders_with_price.sort_by(|a, b| a.converted_price.cmp(&b.converted_price));
+    // orders_with_price.sort_by(|a, b| a.converted_price.cmp(&b.converted_price));
+
+    // version ใหม่ (ที่ใช้และมั่นใจว่าถูก) - เก็บไว้เป็น reference
+    // Step 3: Sort by distance ascending (closest to mid first)
+    // ใช้ distance (|converted_price - mid|) เพราะทำงานถูกต้องทั้ง Buy และ Sell
+    // (converted_price ทำงานถูกเฉพาะ Sell เพราะ Sell ที่ไกล = ราคาสูงกว่า
+    //  แต่ Buy ที่ไกล = ราคาต่ำกว่า — เรียงด้วย converted_price จะสลับลำดับผิด)
+    orders_with_price.sort_by(|a, b| a.distance.cmp(&b.distance));
 
     // Step 4: Calculate deficit
     let deficit = capital_required - current_free_balance;
     if deficit <= DEC_ZERO {
-        let keep_ids: Vec<String> = relevant_orders.iter().map(|o| o.intent_id.clone()).collect();
+        let keep_ids: Vec<String> = relevant_orders
+            .iter()
+            .map(|o| o.intent_id.clone())
+            .collect();
         return CancelPlanResult {
             can_approve_intent: true,
             intent_distance: distance_intent,
@@ -341,7 +391,11 @@ pub fn simulate_cancel_plan(
                 format!("Deficit: {} {}", deficit, required_asset),
                 format!("Canceled all {} orders", prepare_orders.len()),
                 format!("Freed: {} {}", freed_amount, required_asset),
-                format!("Still short by: {} {}", deficit - freed_amount, required_asset),
+                format!(
+                    "Still short by: {} {}",
+                    deficit - freed_amount,
+                    required_asset
+                ),
             ],
         };
     }
@@ -376,8 +430,10 @@ pub fn simulate_cancel_plan(
         .map(|(id, _)| id.clone())
         .collect();
 
-    let prepare_order_id_set: std::collections::HashSet<&str> =
-        prepare_orders.iter().map(|item| item.order.intent_id.as_str()).collect();
+    let prepare_order_id_set: std::collections::HashSet<&str> = prepare_orders
+        .iter()
+        .map(|item| item.order.intent_id.as_str())
+        .collect();
 
     let keep_ids: Vec<String> = relevant_orders
         .iter()
@@ -437,6 +493,19 @@ pub fn simulate_cancel_plan(
 // Fallback: Simple Priority Algorithm
 // ================================================================
 
+/// distance ของ intent จาก Mid ของคู่ตัวเอง (หน่วย: สัดส่วนของราคา เช่น 0.07 = 7%)
+/// ใช้เทียบกับ `TrackedOrderForCem.cem_priority` ที่คำนวณตอน track ด้วยสเกลเดียวกัน
+fn intent_distance_from_mid(
+    intent: &OrderIntentForCem,
+    mid_map: &HashMap<String, Decimal>,
+) -> Option<Decimal> {
+    mid_map
+        .get(&normalize_symbol(&intent.symbol))
+        .copied()
+        .filter(|mid| *mid > DEC_ZERO)
+        .map(|mid| (intent.price - mid).abs() / mid)
+}
+
 pub fn fallback_simple_plan(
     intent: &OrderIntentForCem,
     current_free_balance: Decimal,
@@ -464,12 +533,34 @@ pub fn fallback_simple_plan(
         };
     }
 
-    // Sort by cem_priority ascending (lower = cancel first)
-    let mut sorted_orders = pending_orders.to_vec();
+    // 1) กรองเฉพาะ order ที่ล็อก "สกุลเดียวกับที่ intent ต้องการ" + Approved + ยกเลิกได้
+    //    ถ้าไม่กรองสกุล จะไปยกเลิก order ผิดสกุล เช่น deficit SUI แต่ดันยกเลิก order ที่ล็อก USDT
+    //    (เงินไม่ได้คืนสกุลที่ต้องการ -> plan ดูผ่านแต่ใช้จริงไม่ได้)
+    let mut sorted_orders: Vec<TrackedOrderForCem> = pending_orders
+        .iter()
+        .filter(|o| {
+            o.status == IntentStatus::Approved
+                && o.can_be_canceled
+                && o.required_asset
+                    .eq_ignore_ascii_case(&intent.required_asset)
+        })
+        .cloned()
+        .collect();
+
+    // 2) รักษา order ที่ "ใกล้ตลาดกว่า" intent ไว้ (เทียบได้เฉพาะเมื่อรู้ priority ทั้งคู่)
+    //    ส่วน order ที่ไม่รู้ priority ยังมีสิทธิ์ถูกยกเลิกแต่ถูกจัดไว้ท้ายๆ
+    sorted_orders.retain(|o| match (o.cem_priority, intent_distance) {
+        (Some(order_priority), Some(intent_priority)) => order_priority >= intent_priority,
+        _ => true,
+    });
+
+    // 3) เรียงลำดับยกเลิก: ไกล mid ก่อน (cem_priority DESC)
+    //    เดิม sort ASC จะไปยกเลิก order ที่ใกล้ตลาดที่สุดก่อน = ผิดทิศกับ market-aware plan
+    //    ไม่รู้ priority = 0 = ถูกยกเลิกเป็นลำดับสุดท้าย
     sorted_orders.sort_by(|a, b| {
         let pa = a.cem_priority.unwrap_or(DEC_ZERO);
         let pb = b.cem_priority.unwrap_or(DEC_ZERO);
-        pa.cmp(&pb)
+        pb.cmp(&pa)
     });
 
     let mut orders_to_cancel: Vec<String> = Vec::new();
@@ -514,7 +605,10 @@ pub fn fallback_simple_plan(
         orders_to_keep,
         orders_to_park: parked_scores,
         simulated_free_balance_after_cancel: simulated_free,
-        reason: format!("Simple priority-based plan (fallback): freed {}", freed_amount),
+        reason: format!(
+            "Simple priority-based plan (fallback): freed {}",
+            freed_amount
+        ),
         decision_trace: vec![format!("Fallback: Freed {}", freed_amount)],
     }
 }
@@ -571,6 +665,11 @@ mod tests {
             locked_amount: dec!(50.0),
             can_be_canceled: true,
             cem_priority: None,
+            status: IntentStatus::Approved,
+            bot_id: "bot_1".to_string(),
+            created_at: None,
+            inst_id_code: None,
+            live_confirmed: false,
         }];
 
         // free = 200 >= cost = 100
@@ -608,6 +707,11 @@ mod tests {
                 locked_amount: dec!(60.0),
                 can_be_canceled: true,
                 cem_priority: None,
+                status: IntentStatus::Approved,
+                bot_id: "bot_1".to_string(),
+                created_at: None,
+                inst_id_code: None,
+                live_confirmed: false,
             },
             TrackedOrderForCem {
                 intent_id: "ord_far".to_string(),
@@ -617,6 +721,11 @@ mod tests {
                 locked_amount: dec!(70.0),
                 can_be_canceled: true,
                 cem_priority: None,
+                status: IntentStatus::Approved,
+                bot_id: "bot_2".to_string(),
+                created_at: None,
+                inst_id_code: None,
+                live_confirmed: false,
             },
         ];
 
@@ -626,5 +735,87 @@ mod tests {
         assert!(res.can_approve_intent);
         assert_eq!(res.orders_to_cancel, vec!["ord_far".to_string()]);
         assert!(res.orders_to_keep.contains(&"ord_near".to_string()));
+    }
+
+    fn tracked(
+        id: &str,
+        asset: &str,
+        price: Decimal,
+        locked: Decimal,
+        priority: Option<Decimal>,
+    ) -> TrackedOrderForCem {
+        TrackedOrderForCem {
+            intent_id: id.to_string(),
+            symbol: "SUI-USDT".to_string(),
+            required_asset: asset.to_string(),
+            price,
+            locked_amount: locked,
+            can_be_canceled: true,
+            cem_priority: priority,
+            status: IntentStatus::Approved,
+            bot_id: "bot-test".to_string(),
+            created_at: Some(1),
+            inst_id_code: None,
+            live_confirmed: false,
+        }
+    }
+
+    #[test]
+    fn fallback_cancels_only_same_asset_and_furthest_priority_first() {
+        // Deficit เป็น SUI -> ห้ามแตะ order ที่ล็อก USDT และต้องยกเลิกที่ "ไกล mid" ก่อน
+        let intent = OrderIntentForCem {
+            intent_id: "new_sell".to_string(),
+            symbol: "SUI-USDT".to_string(),
+            required_asset: "SUI".to_string(),
+            price: dec!(1.1954),
+            amount: dec!(6.4336),
+            estimated_cost: dec!(6.4336),
+        };
+        let pending = vec![
+            tracked("buy_usdt", "USDT", dec!(0.9), dec!(100.0), Some(dec!(0.3))),
+            tracked(
+                "sell_far",
+                "SUI",
+                dec!(1.2983),
+                dec!(10.3665),
+                Some(dec!(0.17)),
+            ),
+            tracked("sell_near", "SUI", dec!(1.12), dec!(5.0), Some(dec!(0.01))),
+        ];
+
+        // free = 1.1977 SUI -> deficit = 5.2359 SUI
+        let plan = fallback_simple_plan(&intent, dec!(1.1977), &pending, Some(dec!(0.074)));
+
+        assert!(plan.can_approve_intent);
+        // ยกเลิกเฉพาะ SUI ที่ไกล mid ไม่แตะ order ผิดสกุล/order ที่ใกล้ตลาดกว่า intent
+        assert_eq!(plan.orders_to_cancel, vec!["sell_far".to_string()]);
+    }
+
+    #[test]
+    fn fallback_parks_intent_when_all_candidates_closer_to_market() {
+        // intent ไกล mid กว่าทุก candidate -> ยกเลิกใครก็เสียของดีกว่า -> ต้อง park intent
+        let intent = OrderIntentForCem {
+            intent_id: "worst_sell".to_string(),
+            symbol: "SUI-USDT".to_string(),
+            required_asset: "SUI".to_string(),
+            price: dec!(1.9),
+            amount: dec!(6.4336),
+            estimated_cost: dec!(6.4336),
+        };
+        let pending = vec![
+            tracked(
+                "sell_far",
+                "SUI",
+                dec!(1.2983),
+                dec!(10.3665),
+                Some(dec!(0.17)),
+            ),
+            tracked("sell_near", "SUI", dec!(1.12), dec!(5.0), Some(dec!(0.01))),
+        ];
+
+        let plan = fallback_simple_plan(&intent, dec!(1.1977), &pending, Some(dec!(0.7)));
+
+        assert!(!plan.can_approve_intent);
+        assert!(plan.orders_to_cancel.is_empty());
     }
 }

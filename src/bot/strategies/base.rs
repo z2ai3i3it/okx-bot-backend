@@ -63,11 +63,43 @@ pub trait Strategy: Send + Sync {
     /// แจ้งเตือนเมื่อเกิดการจับคู่ซื้อขายจริง
     fn on_fill_update(&mut self, fill: &OkxMyTradeData) -> Vec<StrategyAction>;
 
+    /// ตรวจสอบว่า `client_order_id` เป็นคำสั่งของ Strategy นี้หรือไม่ (รวมถึงที่ถูก Park ไว้)
+    ///
+    /// Private WS ของ OKX ส่ง order update ของ **ทุกคำสั่งใน account** ให้ทุก connection
+    /// ดังนั้น Executor ใช้ method นี้กรอง ไม่ให้บอทอื่นแตะ preemption flag / CEM pool
+    /// ของคำสั่งที่ไม่ใช่ของตัวเอง
+    ///
+    /// Default = true เพื่อไม่เปลี่ยนพฤติกรรม Strategy ที่ยังไม่ override
+    fn owns_client_order_id(&self, _client_order_id: &str) -> bool {
+        true
+    }
+
     /// Hook สำหรับกู้คืน State (Recovery Reconcile) เมื่อ Bot Start/Restart
     /// รับรายการ Trades ที่ตกค้างหรือเกิดขึ้นระหว่างที่บอทออฟไลน์ เพื่อ Replay State ให้เป็นปัจจุบัน
     fn on_recovery_reconcile(&mut self, _missed_trades: &[OkxMyTradeData]) -> Result<(), String> {
         Ok(())
     }
+
+    /// Hook เมื่อ CEM ปลุกคำสั่งที่เคยถูก Park ไว้หลังจากมี Balance คืนเข้ามา
+    /// ให้ Strategy ตรวจสอบว่าคำสั่งนั้นยังเป็น Order ปัจจุบันที่ต้องการวางหรือไม่ และคืน PlaceOrder Action ออกมา
+    fn on_cem_reactivate(
+        &mut self,
+        _reactivated_order: &crate::pipeline::simulate_cancel_plan::TrackedOrderForCem,
+    ) -> Vec<StrategyAction> {
+        Vec::new()
+    }
+
+    /// Hook เมื่อ Order ถูก CEM สั่ง Cancel ล่วงหน้าเพื่อเคลียร์ Balance ให้ Order ที่ใกล้ตลาดกว่า (Preemption)
+    /// ให้ Strategy ย้ายคำสั่งนี้เข้า Parked Pool และไม่ Trigger Healing
+    fn on_cem_preemption_canceled(&mut self, _cl_ord_id: &str) {}
+
+    /// Hook เมื่อ Action ถูก Pipeline ปฏิเสธ (เช่น CEM Reject/Park)
+    fn on_action_failed(&mut self, _action: &StrategyAction, _reason: &str) {}
+
+    /// Hook เมื่อ OKX ปฏิเสธ place "หลัง" dispatch (เช่น 51008 insufficient balance)
+    /// — order ไม่เคยขึ้น exchange และจะไม่มี terminal event มาเอง
+    /// ให้ strategy ย้ายคำสั่งกลับเป็น PARKED (CEM จะปลุกใหม่เมื่อเงินพอ) และหยุด chase
+    fn on_place_rejected(&mut self, _cl_ord_id: &str, _reason: &str) {}
 
     /// ดึง Rebalance Snapshot ล่าสุด (ถ้ามี) เพื่อนำไป persist ลง database
     fn get_latest_snapshot(&self) -> Option<crate::bot::math::fixed_ratio_cal::RebalanceRecord> {

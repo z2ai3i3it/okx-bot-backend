@@ -61,6 +61,8 @@ pub struct FixedRatioStrategy {
     pub snapshot: Option<RebalanceRecord>,
     pub tracked_buy: Option<TrackedOrder>,
     pub tracked_sell: Option<TrackedOrder>,
+    pub parked_buy: Option<TrackedOrder>,
+    pub parked_sell: Option<TrackedOrder>,
     pub chasing_state: Option<ChasingState>,
 
     /// ปริมาณที่ Fill สะสมแล้วต่อ clOrdId (Trade-Centric Guard)
@@ -94,6 +96,8 @@ impl FixedRatioStrategy {
             snapshot: None,
             tracked_buy: None,
             tracked_sell: None,
+            parked_buy: None,
+            parked_sell: None,
             chasing_state: None,
             cumulative_filled: HashMap::new(),
             processed_trade_ids: HashSet::new(),
@@ -713,6 +717,32 @@ impl Strategy for FixedRatioStrategy {
     fn on_ticker(&mut self, ticker: &OkxTickerData) -> Vec<StrategyAction> {
         if !self.is_matching_pair(&ticker.inst_id) {
             return vec![];
+        }
+
+        // Guard: ถ้า order ที่กำลัง chase ไม่อยู่ใน tracked อีกแล้ว (ถูก Park/Finalize) ให้หยุด chase
+        // ไม่งั้นจะยิง amend ไปหาคำสั่งที่ไม่มีอยู่จริงบน exchange (OKX sCode=51503)
+        if let Some(chasing_id) = self
+            .chasing_state
+            .as_ref()
+            .map(|c| c.client_order_id.clone())
+        {
+            let still_tracked = self
+                .tracked_buy
+                .as_ref()
+                .is_some_and(|o| o.cl_ord_id == chasing_id)
+                || self
+                    .tracked_sell
+                    .as_ref()
+                    .is_some_and(|o| o.cl_ord_id == chasing_id);
+            if !still_tracked {
+                log::warn!(
+                    "[Bot #{}] 🏃 [Chasing] Stopped: order {} is no longer active on this strategy (parked/finalized)",
+                    self.bot_id,
+                    chasing_id
+                );
+                self.chasing_state = None;
+                return vec![];
+            }
         }
 
         // 1. ถ้ามีคำสั่ง Chasing อยู่ในกระบวนการ ให้ประเมินและปรับราคา (Amend) เกาะตลาด
@@ -1469,6 +1499,182 @@ impl Strategy for FixedRatioStrategy {
         }
 
         Ok(())
+    }
+
+    fn owns_client_order_id(&self, client_order_id: &str) -> bool {
+        self.tracks_client_order_id(client_order_id)
+            || self
+                .parked_buy
+                .as_ref()
+                .is_some_and(|o| o.cl_ord_id == client_order_id)
+            || self
+                .parked_sell
+                .as_ref()
+                .is_some_and(|o| o.cl_ord_id == client_order_id)
+            || self
+                .chasing_state
+                .as_ref()
+                .is_some_and(|c| c.client_order_id == client_order_id)
+    }
+
+    fn on_cem_reactivate(
+        &mut self,
+        reactivated_order: &crate::pipeline::simulate_cancel_plan::TrackedOrderForCem,
+    ) -> Vec<StrategyAction> {
+        // ตรวจสอบว่าคำสั่งนี้ตรงกับ parked_buy หรือ parked_sell หรือ tracked ของบอทตัวนี้หรือไม่
+        let is_buy = self
+            .parked_buy
+            .as_ref()
+            .map_or(false, |b| b.cl_ord_id == reactivated_order.intent_id)
+            || self
+                .tracked_buy
+                .as_ref()
+                .map_or(false, |b| b.cl_ord_id == reactivated_order.intent_id);
+
+        let is_sell = self
+            .parked_sell
+            .as_ref()
+            .map_or(false, |s| s.cl_ord_id == reactivated_order.intent_id)
+            || self
+                .tracked_sell
+                .as_ref()
+                .map_or(false, |s| s.cl_ord_id == reactivated_order.intent_id);
+
+        if !is_buy && !is_sell {
+            // หมายเหตุ: ไม่ใช่ capital leak — executor จะเจอ actions ว่างแล้วเรียก
+            // abandon_reactivated_order คืนเงินจองกลับ free ทันที (log "Reactivation abandoned")
+            log::warn!(
+                "[Bot #{}] ⚠️ CEM reactivate skipped for {} (not tracked or parked in this bot) — lock will be returned to CEM free by executor",
+                self.bot_id,
+                reactivated_order.intent_id
+            );
+            return Vec::new();
+        }
+
+        let side_str = if is_buy { "buy" } else { "sell" };
+        let inst_id_code = self.get_inst_id_code();
+
+        // ย้ายจาก parked กลับมาเป็น active tracked order บนกระดานจริง
+        if is_buy {
+            if let Some(parked) = self.parked_buy.take() {
+                self.tracked_buy = Some(parked);
+            }
+        } else if let Some(parked) = self.parked_sell.take() {
+            self.tracked_sell = Some(parked);
+        }
+
+        // ล้าง planned flag ของ preemption เก่า: clOrdId ตัวเดิมถูกวางขึ้นกระดานใหม่แล้ว
+        // -> การ cancel ครั้งถัดไป (เช่น user กด cancel บน exchange โดยตรง cancelSource=1)
+        //    ต้องถูกจับเป็น unplanned แล้ว Self-Heal (8.4.1) ไม่ใช่ finalize เงียบๆ (8.4.3)
+        self.planned_cancel_order_ids.remove(&reactivated_order.intent_id);
+
+        let place_arg = WsPlaceOrderArg {
+            id: None,
+            inst_id: self.pair.clone(),
+            inst_id_code,
+            td_mode: "cash".to_string(),
+            side: side_str.to_string(),
+            ord_type: "post_only".to_string(),
+            sz: reactivated_order.locked_amount.to_string(),
+            px: Some(reactivated_order.price.to_string()),
+            client_order_id: Some(reactivated_order.intent_id.clone()),
+            tag: None,
+        };
+
+        log::info!(
+            "[Bot #{}] 🚀 [CEM Reactivated Order] Re-placing {} order from PARKED to ACTIVE: clOrdId={}, px={}, sz={}",
+            self.bot_id,
+            side_str.to_uppercase(),
+            reactivated_order.intent_id,
+            reactivated_order.price,
+            reactivated_order.locked_amount
+        );
+
+        vec![StrategyAction::PlaceOrder {
+            arg: place_arg,
+            reference_bid: None,
+            reference_ask: None,
+        }]
+    }
+
+    fn on_cem_preemption_canceled(&mut self, cl_ord_id: &str) {
+        // ลงทะเบียนใน planned_cancel_order_ids เพื่อไม่ให้ on_order_update รัน healing
+        self.planned_cancel_order_ids.insert(cl_ord_id.to_string());
+        // หยุด chase ถ้าคำสั่งที่ถูก preempt กำลังถูก chase อยู่ (มันไม่มีบน exchange แล้ว)
+        if self
+            .chasing_state
+            .as_ref()
+            .is_some_and(|c| c.client_order_id == cl_ord_id)
+        {
+            self.chasing_state = None;
+        }
+        log::info!(
+            "[Bot #{}] 🅿️ [CEM Preemption Cancel] Moving order {} to PARKED, skipping healing.",
+            self.bot_id, cl_ord_id
+        );
+        if self.tracked_buy.as_ref().map_or(false, |b| b.cl_ord_id == cl_ord_id) {
+            self.parked_buy = self.tracked_buy.take();
+        }
+        if self.tracked_sell.as_ref().map_or(false, |s| s.cl_ord_id == cl_ord_id) {
+            self.parked_sell = self.tracked_sell.take();
+        }
+    }
+
+    fn on_action_failed(&mut self, action: &StrategyAction, reason: &str) {
+        if let StrategyAction::PlaceOrder { arg, .. } = action {
+            if let Some(cl_ord_id) = &arg.client_order_id {
+                log::warn!(
+                    "[Bot #{}] 🅿️ PlaceOrder parked by CEM: clOrdId={}. Reason: {}. Moving to parked orders.",
+                    self.bot_id, cl_ord_id, reason
+                );
+                // ย้ายจาก active tracked order บนกระดานจริงไปเป็น parked_buy/parked_sell
+                if self.tracked_buy.as_ref().map_or(false, |b| &b.cl_ord_id == cl_ord_id) {
+                    self.parked_buy = self.tracked_buy.take();
+                }
+                if self.tracked_sell.as_ref().map_or(false, |s| &s.cl_ord_id == cl_ord_id) {
+                    self.parked_sell = self.tracked_sell.take();
+                }
+                // หยุด chase เพราะคำสั่งนี้ไม่ได้อยู่บน exchange (ถูก CEM park ก่อนวางจริง)
+                if self
+                    .chasing_state
+                    .as_ref()
+                    .is_some_and(|c| &c.client_order_id == cl_ord_id)
+                {
+                    self.chasing_state = None;
+                }
+            }
+        }
+    }
+
+    /// OKX ปฏิเสธ place หลัง dispatch (เช่น 51008 insufficient balance) — order ไม่เคยขึ้น exchange
+    /// และจะไม่มี terminal event มาเอง -> ต้องย้ายกลับเป็น PARKED ไม่งั้น strategy ยังถือว่า
+    /// order อยู่บน exchange (เคสจริง sell ของ bot #3 หายจาก exchange โดยไม่มีใครรู้ จนกว่าจะ restart)
+    fn on_place_rejected(&mut self, cl_ord_id: &str, reason: &str) {
+        log::warn!(
+            "[Bot #{}] ❌ [Place Rejected] clOrdId={} ({}) never reached exchange — moving back to PARKED (CEM will retry when capital frees)",
+            self.bot_id, cl_ord_id, reason
+        );
+        if self
+            .tracked_buy
+            .as_ref()
+            .map_or(false, |b| b.cl_ord_id == cl_ord_id)
+        {
+            self.parked_buy = self.tracked_buy.take();
+        }
+        if self
+            .tracked_sell
+            .as_ref()
+            .map_or(false, |s| s.cl_ord_id == cl_ord_id)
+        {
+            self.parked_sell = self.tracked_sell.take();
+        }
+        if self
+            .chasing_state
+            .as_ref()
+            .is_some_and(|c| c.client_order_id == cl_ord_id)
+        {
+            self.chasing_state = None;
+        }
     }
 
     fn get_latest_snapshot(&self) -> Option<RebalanceRecord> {
@@ -2371,5 +2577,197 @@ mod tests {
             strategy.chasing_state.is_some(),
             "ต้องตั้ง chasing state สำหรับ order ที่ heal"
         );
+    }
+
+    #[test]
+    fn parking_order_stops_chasing_and_ownership_covers_parked_orders() {
+        let mut strategy = FixedRatioStrategy::new(
+            "bot-test-park".to_string(),
+            "BTC-USDT".to_string(),
+            mock_config(),
+        );
+
+        let cl_ord_id = "cl_sell_park_1".to_string();
+        strategy.tracked_sell = Some(TrackedOrder {
+            cl_ord_id: cl_ord_id.clone(),
+            side: Side::Sell,
+            price: dec!(50000.0),
+            amount: dec!(0.001),
+        });
+        strategy.chasing_state = Some(ChasingState {
+            client_order_id: cl_ord_id.clone(),
+            side: Side::Sell,
+            current_price: dec!(50000.0),
+            anchor_price: dec!(49990.0),
+            last_amend_time: Instant::now(),
+        });
+        assert!(strategy.owns_client_order_id(&cl_ord_id));
+        assert!(!strategy.owns_client_order_id("cl_other_bot"));
+
+        let action = StrategyAction::PlaceOrder {
+            arg: WsPlaceOrderArg {
+                id: None,
+                inst_id: "BTC-USDT".to_string(),
+                inst_id_code: None,
+                td_mode: "cash".to_string(),
+                side: "sell".to_string(),
+                ord_type: "post_only".to_string(),
+                sz: "0.001".to_string(),
+                px: Some("50000.0".to_string()),
+                client_order_id: Some(cl_ord_id.clone()),
+                tag: None,
+            },
+            reference_bid: None,
+            reference_ask: None,
+        };
+        strategy.on_action_failed(&action, "CEM Gatekeeper park");
+
+        assert!(strategy.tracked_sell.is_none());
+        assert!(strategy.parked_sell.is_some());
+        assert!(
+            strategy.chasing_state.is_none(),
+            "ต้องหยุด chase เมื่อ order ถูก park (ไม่งั้นจะ amend order ที่ไม่มีบน exchange -> 51503)"
+        );
+        assert!(
+            strategy.owns_client_order_id(&cl_ord_id),
+            "เจ้าของต้องยังครอบครอง order ที่ถูก park อยู่"
+        );
+    }
+
+    /// Regression จาก zzz.log 2026-10-13 step 4: sell ที่เคยถูก CEM preempt แล้วถูก reactivate
+    /// ด้วย clOrdId เดิม -> เมื่อ user กด cancel บน exchange โดยตรง (cancelSource=1)
+    /// ต้องถูกจับเป็น Unplanned Cancel แล้ว Self-Heal (วางใหม่) ไม่ใช่ finalize เฉยๆ
+    /// (เดิม planned_cancel_order_ids ที่ insert ตอน preempt ค้างอยู่หลัง re-place -> 8.4.3 กินซะก่อน)
+    #[test]
+    fn test_reactivated_order_external_cancel_self_heals() {
+        let config = mock_config();
+        let mut strategy = FixedRatioStrategy::new(
+            "bot-reactivate-cancel".to_string(),
+            "BTC-USDT".to_string(),
+            config,
+        );
+
+        strategy.tracked_sell = Some(TrackedOrder {
+            cl_ord_id: "sell-react-1".to_string(),
+            side: Side::Sell,
+            price: dec!(61000),
+            amount: dec!(0.01),
+        });
+
+        // 1. CEM preempt: ยกเลิก sell -> insert เข้า planned_cancel_order_ids + ย้ายไป parked
+        strategy.on_cem_preemption_canceled("sell-react-1");
+        assert!(strategy.tracked_sell.is_none());
+        assert!(strategy.parked_sell.is_some());
+        assert!(
+            strategy.planned_cancel_order_ids.contains("sell-react-1"),
+            "state ก่อน reactivate ต้องมี planned flag (precondition ของบั๊ก)"
+        );
+
+        // 2. เงินว่าง -> CEM reactivate: re-place ด้วย clOrdId เดิม ต้องล้าง planned flag เก่าด้วย
+        let reactivated = crate::pipeline::simulate_cancel_plan::TrackedOrderForCem {
+            intent_id: "sell-react-1".to_string(),
+            symbol: "BTC-USDT".to_string(),
+            required_asset: "BTC".to_string(),
+            price: dec!(61000),
+            locked_amount: dec!(0.01),
+            can_be_canceled: true,
+            cem_priority: Some(dec!(0.1)),
+            status: crate::pipeline::simulate_cancel_plan::IntentStatus::Approved,
+            bot_id: "bot-reactivate-cancel".to_string(),
+            created_at: Some(1),
+            inst_id_code: None,
+            live_confirmed: false,
+        };
+        let reactivate_actions = strategy.on_cem_reactivate(&reactivated);
+        assert_eq!(reactivate_actions.len(), 1, "ต้องสั่ง re-place 1 คำสั่ง");
+        assert!(strategy.tracked_sell.is_some(), "tracked_sell ต้องกลับมา");
+        assert!(
+            !strategy.planned_cancel_order_ids.contains("sell-react-1"),
+            "flag ของ preemption เก่าต้องถูกล้างตอน reactivate"
+        );
+
+        // 3. User กด cancel บน exchange โดยตรง (cancelSource=1, fill=0) -> ต้อง Self-Heal
+        let cancel_event = OkxOrderUpdateData {
+            inst_id: "BTC-USDT".to_string(),
+            order_id: "ord-react-canceled".to_string(),
+            client_order_id: "sell-react-1".to_string(),
+            state: "canceled".to_string(),
+            side: "sell".to_string(),
+            px: "61000.0".to_string(),
+            sz: "0.01".to_string(),
+            fill_size: "0".to_string(),
+            acc_fill_size: "0".to_string(),
+            cancel_source: "1".to_string(),
+            ..Default::default()
+        };
+        let actions = strategy.on_order_update(&cancel_event);
+        let healed = actions
+            .iter()
+            .find_map(|a| match a {
+                StrategyAction::PlaceOrder { arg, .. } => Some(arg),
+                _ => None,
+            })
+            .expect("cancel ภายนอกหลัง reactivate ต้อง Self-Heal (วางใหม่) ไม่ใช่ finalize");
+        assert_eq!(healed.side, "sell");
+        assert_eq!(healed.sz, "0.01");
+        assert_ne!(
+            healed.client_order_id.as_deref(),
+            Some("sell-react-1"),
+            "ต้องได้ clOrdId ใหม่"
+        );
+        assert!(strategy.tracked_sell.is_some());
+        assert!(strategy.chasing_state.is_some());
+    }
+
+    /// Regression ของ incident app_2026-10-13_03-55 (สมมติฐาน H3):
+    /// OKX ปฏิเสธ place หลัง dispatch (51008 insufficient balance) -> ไม่มี terminal event มาเอง
+    /// strategy ต้องย้าย tracked กลับเป็น PARKED (รอ CEM ปลุกใหม่) + หยุด chase
+    /// ไม่งั้น bot ยังคิดว่า order อยู่บน exchange -> chase ใส่ order ที่ไม่มีจริง (51503)
+    /// และไม่มีใคร rebalance ฝั่งนี้จนกว่าจะ restart
+    #[test]
+    fn place_rejected_moves_tracked_sell_back_to_parked_and_stops_chasing() {
+        let mut strategy = FixedRatioStrategy::new(
+            "bot-place-reject".to_string(),
+            "BTC-USDT".to_string(),
+            mock_config(),
+        );
+        let cl_ord_id = "cl_place_rejected".to_string();
+        strategy.tracked_sell = Some(TrackedOrder {
+            cl_ord_id: cl_ord_id.clone(),
+            side: Side::Sell,
+            price: dec!(50000.0),
+            amount: dec!(0.001),
+        });
+        strategy.chasing_state = Some(ChasingState {
+            client_order_id: cl_ord_id.clone(),
+            side: Side::Sell,
+            current_price: dec!(50000.0),
+            anchor_price: dec!(49990.0),
+            last_amend_time: Instant::now(),
+        });
+
+        strategy.on_place_rejected(
+            &cl_ord_id,
+            "51008 Order failed. Insufficient SUI balance in account.",
+        );
+
+        assert!(strategy.tracked_sell.is_none());
+        assert!(
+            strategy.parked_sell.is_some(),
+            "ต้องย้ายกลับเป็น PARKED เพื่อรอ CEM ปลุกใหม่เมื่อเงินพอ"
+        );
+        assert!(
+            strategy.chasing_state.is_none(),
+            "ต้องหยุด chase เพราะ order ไม่ได้อยู่บน exchange"
+        );
+        assert!(
+            strategy.owns_client_order_id(&cl_ord_id),
+            "เจ้าของต้องยังครอบครอง order เพื่อรับ reactivation จาก CEM"
+        );
+
+        // คำสั่งของบอทอื่นห้ามโดนแตะ
+        strategy.on_place_rejected("cl_other_bot", "51008");
+        assert!(strategy.parked_sell.is_some());
+        assert!(strategy.tracked_sell.is_none());
     }
 }

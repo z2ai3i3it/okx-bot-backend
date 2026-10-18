@@ -20,6 +20,17 @@ impl DedupStep {
         }
     }
 
+    pub async fn remove(&self, bot_id: &str, account_id: &str, inst_id: &str, cl_ord_id: &str) {
+        let key = (
+            bot_id.to_string(),
+            account_id.to_string(),
+            inst_id.to_string(),
+            cl_ord_id.to_string(),
+        );
+        let mut seen = self.seen_place_order_ids.lock().await;
+        seen.remove(&key);
+    }
+
     pub async fn execute(&self, ctx: &mut PipelineContext) -> Result<(), String> {
         if ctx.op_type != OrderOpType::PlaceSingle {
             return Ok(());

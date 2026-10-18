@@ -292,7 +292,12 @@ impl StrategyService {
 
         // --- สตาร์ท Public WebSocket (subscribe ticker สำหรับคู่เหรียญนี้) ---
         let public_ws = self.okx_manager.public_ws().clone();
-        let subscriptions = vec![WsSubscriptionArg::per_instrument("tickers", &strategy.pair)];
+        let mut subscriptions = vec![WsSubscriptionArg::per_instrument("tickers", &strategy.pair)];
+        // Subscribe BTC-USDT ticker เพื่อใช้เป็น Mid Price อ้างอิงของ CEM Cancel Plan
+        // (ถ้าไม่มี BTC/USDT mid จะ fallback ไป simple plan เสมอ)
+        if !strategy.pair.eq_ignore_ascii_case("BTC-USDT") {
+            subscriptions.push(WsSubscriptionArg::per_instrument("tickers", "BTC-USDT"));
+        }
         public_ws.start(subscriptions);
 
         // --- สร้าง Trade Client พร้อม start() background task ---

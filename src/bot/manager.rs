@@ -27,6 +27,8 @@ pub enum BotManagerError {
 pub struct BotManager {
     /// บันทึก CancellationToken ของบอทที่กำลังรันอยู่ (Key คือ Bot ID)
     active_tokens: Arc<RwLock<HashMap<String, CancellationToken>>>,
+    /// Shared CEM Manager แยกต่อ Account ID (1 Account มี 1 CemManager ร่วมกันข้ามทุกบอท)
+    cem_managers: Arc<RwLock<HashMap<String, Arc<crate::pipeline::steps::CemManager>>>>,
     rebalance_service: Arc<RebalanceService>,
     strategy_repository: Arc<StrategyRepository>,
 }
@@ -38,9 +40,19 @@ impl BotManager {
     ) -> Self {
         Self {
             active_tokens: Arc::new(RwLock::new(HashMap::new())),
+            cem_managers: Arc::new(RwLock::new(HashMap::new())),
             rebalance_service,
             strategy_repository,
         }
+    }
+
+    /// ดึงหรือสร้าง CemManager ประจำ account_id (Shared Instance)
+    pub async fn get_or_create_cem(&self, account_id: &str) -> Arc<crate::pipeline::steps::CemManager> {
+        let mut guard = self.cem_managers.write().await;
+        guard
+            .entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(crate::pipeline::steps::CemManager::new()))
+            .clone()
     }
 
     /// ตรวจสอบว่าบอทกำลังรันอยู่หรือไม่
@@ -61,6 +73,7 @@ impl BotManager {
         inst_id_code: Option<u64>,
     ) -> Result<(), BotManagerError> {
         let bot_id = strategy.id.clone();
+        let account_id = strategy.account_id.clone();
 
         let mut guard = self.active_tokens.write().await;
         if guard.contains_key(&bot_id) {
@@ -71,10 +84,18 @@ impl BotManager {
         guard.insert(bot_id.clone(), cancel_token.clone());
         drop(guard);
 
-        // สร้าง Pipeline และ Executor
-        let pipeline = crate::pipeline::order_pipeline::OrderPipeline::new(
+        // ดึงหรือสร้าง Shared CemManager ประจำ account นี้
+        let cem_manager = self.get_or_create_cem(&account_id).await;
+        let cem_step = crate::pipeline::steps::CemStep::with_manager_and_client(
+            cem_manager,
+            trade_client.clone(),
+        );
+
+        // สร้าง Pipeline ด้วย Shared CEM Step และ Executor
+        let pipeline = crate::pipeline::order_pipeline::OrderPipeline::with_cem(
             rate_limiter,
             trade_client.clone(),
+            cem_step,
         );
         let executor = BotExecutor::with_dependencies(
             strategy,

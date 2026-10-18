@@ -20,7 +20,7 @@ fn log_format(
     write!(
         w,
         "[{}] {} [{}:{}] {}",
-        now.format("%Y-%m-%d %H:%M:%S%.3f"),
+        now.format("%Y-%m-%d %H:%M:%S%.9f"),
         record.level(),
         record.file().unwrap_or("unknown"),
         record.line().unwrap_or(0),

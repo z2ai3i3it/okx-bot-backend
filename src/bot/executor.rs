@@ -11,7 +11,10 @@ use crate::{
     },
     domain::strategy::{Strategy as StrategyModel, StrategyStatus},
     okx::{
-        dto::trade::{OkxMyTradeData, OkxOrderUpdateData},
+        dto::{
+            market::OkxTickerData,
+            trade::{OkxMyTradeData, OkxOrderUpdateData},
+        },
         ws_client::OkxPublicWsClient,
         ws_trade::OkxWsTradeClient,
     },
@@ -151,6 +154,39 @@ impl BotExecutor {
         })
     }
 
+    /// คำนวณ Mid Price จาก ticker (ใช้ค่าเฉลี่ย bid/ask ถ้ามี ไม่งั้น fallback เป็น last)
+    fn mid_price_from_ticker(ticker: &OkxTickerData) -> Option<Decimal> {
+        let bid = Decimal::from_str(&ticker.bid_price)
+            .ok()
+            .filter(|v| *v > Decimal::ZERO);
+        let ask = Decimal::from_str(&ticker.ask_price)
+            .ok()
+            .filter(|v| *v > Decimal::ZERO);
+        if let (Some(bid), Some(ask)) = (bid, ask) {
+            return Some((bid + ask) / Decimal::TWO);
+        }
+        Decimal::from_str(&ticker.last)
+            .ok()
+            .filter(|v| *v > Decimal::ZERO)
+    }
+
+    /// ปลุก Parked Orders (global เรียงตาม Priority) แล้ว route กลับไปให้ "บอทเจ้าของ" วางใหม่
+    /// เรียกได้จากทุก event ที่ทำให้เงินว่างขึ้น (terminal order / balance update / ticker)
+    ///
+    /// - reevaluate ต้อง global: ผู้แพ้ preemption ก็เป็นคนปลดล็อกเงินด้วย ถ้า owner-scoped
+    ///   มันจะปลุกตัวเองก่อนแล้วแย่งเงินคืนจากผู้ชนะ (priority สูงกว่า)
+    /// - route ต้องกลับเจ้าของ: ทุก executor เห็น event เดียวกัน ถ้า executor ผิดตัวเป็นคน
+    ///   consume จะเรียก on_cem_reactivate กับ strategy ที่ไม่ได้เป็นเจ้าของ -> ไม่มีใครวาง order จริง
+    async fn reevaluate_and_route(&self) {
+        let Some(cem) = self.pipeline.cem_manager() else {
+            return;
+        };
+        let reactivated = cem.reevaluate_parked_orders().await;
+        for order in reactivated {
+            cem.route_reactivation(order).await;
+        }
+    }
+
     async fn persist_runtime_state(&self, bot_id: &str) -> bool {
         let (Some(repository), Some(state)) = (
             &self.strategy_repository,
@@ -213,11 +249,23 @@ impl BotExecutor {
 
         let results = self
             .pipeline
-            .process_actions(bot_id, account_id, pair, actions)
+            .process_actions(bot_id, account_id, pair, actions.clone())
             .await;
-        for result in results {
+        for (i, result) in results.into_iter().enumerate() {
             if let Err(err) = result {
-                log::error!("[Bot #{}] ❌ Strategy pipeline action failed: {}", bot_id, err);
+                if err.starts_with("CEM Gatekeeper requires canceling") {
+                    // Flow ปกติของ preemption: CEM สั่งยกเลิก order ไกล mid ก่อนเพื่อแย่งเงิน
+                    // -> ไม่ใช่ error — strategy จะ retry order นี้เองเมื่อเงินว่าง
+                    log::info!(
+                        "[Bot #{}] ℹ️ Pipeline deferred by CEM preemption (will retry): {}",
+                        bot_id, err
+                    );
+                } else {
+                    log::error!("[Bot #{}] ❌ Strategy pipeline action failed: {}", bot_id, err);
+                }
+                if let Some(act) = actions.get(i) {
+                    self.strategy_engine.on_action_failed(act, &err);
+                }
             }
         }
     }
@@ -302,6 +350,8 @@ impl BotExecutor {
         // 2. ดึง Receiver สำหรับฟัง Private Streams
         let mut orders_rx = self.trade_client.subscribe_orders();
         let mut trades_rx = self.trade_client.subscribe_my_trades();
+        let mut balance_rx = self.trade_client.subscribe_balance();
+        let mut op_ack_rx = self.trade_client.subscribe_op_acks();
 
         // Subscribe before recovery so exchange updates are buffered during DB reads/cancels.
         loop {
@@ -362,7 +412,49 @@ impl BotExecutor {
             }
         }
 
-        // 3. Heartbeat timer เพื่อตรวจเช็คสถานะ
+        // 3. ดึง Initial Balance ผ่าน REST API เพื่ออุ่นเครื่อง CEM ให้พร้อมทันทีก่อนรับ Ticker แรก
+        if let (Some(cem), Some(rest_client), Some(credentials)) = (
+            self.pipeline.cem_manager(),
+            &self.rest_client,
+            &self.rest_credentials,
+        ) {
+            log::info!("[Bot #{}] 💰 Fetching initial account balance via REST to initialize CEM...", bot_id);
+            match rest_client
+                .get_balance(
+                    &credentials.api_key,
+                    &credentials.secret_key,
+                    &credentials.passphrase,
+                    credentials.is_simulated,
+                )
+                .await
+            {
+                Ok(balance_data) => {
+                    for detail in balance_data.details {
+                        let avail_bal = Decimal::from_str(&detail.available_balance).unwrap_or(Decimal::ZERO);
+                        let total_eq = Decimal::from_str(&detail.equity).unwrap_or(avail_bal);
+                        cem.update_balance_from_ws(&detail.ccy, avail_bal, total_eq).await;
+                    }
+                    log::info!("[Bot #{}] ✅ Initial CEM balances successfully initialized via REST", bot_id);
+                }
+                Err(err) => {
+                    log::warn!(
+                        "[Bot #{}] ⚠️ Could not fetch initial balance via REST: {}. Relying on WebSocket balance stream.",
+                        bot_id, err
+                    );
+                }
+            }
+        }
+
+        // 3. Route สำหรับรับ Reactivated Orders ของบอทนี้ (CEM ส่งกลับมาให้เจ้าของวางใหม่)
+        let (reactivation_tx, mut reactivation_rx) = tokio::sync::mpsc::unbounded_channel();
+        let _reactivation_tx = reactivation_tx.clone(); // ให้ channel เปิดอยู่ตลอด run()
+        if let Some(cem) = self.pipeline.cem_manager() {
+            cem.set_trade_client(self.trade_client.clone()).await;
+            cem.register_reactivation_route(bot_id.clone(), reactivation_tx)
+                .await;
+        }
+
+        // 4. Heartbeat timer เพื่อตรวจเช็คสถานะ
         let mut heartbeat_timer = tokio::time::interval(Duration::from_secs(10));
 
         loop {
@@ -381,7 +473,17 @@ impl BotExecutor {
                 ticker_result = ticker_rx.recv() => {
                     match ticker_result {
                         Ok(ticker) => {
+                            // อัปเดต Mid Price ของ "ทุกคู่" เข้า CEM (รวม BTC-USDT ที่เป็นอ้างอิงของ Cancel Plan)
+                            if let Some(cem) = self.pipeline.cem_manager() {
+                                if let Some(mid_px) = Self::mid_price_from_ticker(&ticker) {
+                                    cem.update_mid_price(&ticker.inst_id, mid_px).await;
+                                }
+                            }
+
                             if ticker.inst_id == pair {
+                                // เงินอาจว่างขึ้นจากบอทอื่น (cancel/fill) -> ปลุกตาม priority แล้ว route กลับเจ้าของ
+                                self.reevaluate_and_route().await;
+
                                 // ส่ง Ticker เข้า Strategy เพื่อประเมิน
                                 let actions = self.strategy_engine.on_ticker(&ticker);
 
@@ -416,11 +518,77 @@ impl BotExecutor {
 
                 // 3. รับอัปเดตสถานะ Orders (Private WS)
                 order_result = orders_rx.recv() => {
-                    match order_result {
-                        Ok(order) => {
+                    match order_result {                        Ok(order) => {
+                            // Private WS ของ account เดียวกันส่ง order ของ "ทุกบอท" มาให้ทุก connection
+                            // เฉพาะ executor ของบอทเจ้าของเท่านั้นที่แตะ preemption flag / CEM pool / reactivation
+                            let owns_order = self
+                                .strategy_engine
+                                .owns_client_order_id(&order.client_order_id);
+
+                            let is_preemption_cancel = if owns_order
+                                && order.state.to_lowercase() == "canceled"
+                            {
+                                if let Some(cem) = self.pipeline.cem_manager() {
+                                    cem.is_planned_preemption_cancel(&order.client_order_id).await
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+
+                            if is_preemption_cancel {
+                                log::info!(
+                                    "[Bot #{}] 🅿️ [CEM Preemption] Order {} was cancelled by CEM preemption plan. Notifying strategy to move to PARKED.",
+                                    bot_id, order.client_order_id
+                                );
+                                self.strategy_engine.on_cem_preemption_canceled(&order.client_order_id);
+                            }
+
+                            // เมื่อ Order มีสถานะ Terminal (filled หรือ canceled) -> ปลดล็อกเงินใน CEM ทันที
+                            // เพื่อให้เมื่อ Strategy ส่ง Action วาง Order คืน (Self-Healing) ทุนจะพร้อมใช้งานทันที
+                            // ไม่เกิด deficit หลอกๆ จากการที่ทุนเก่ายังไม่ถูกปลด
+                            let state_str = order.state.to_lowercase();
+                            let is_terminal = state_str == "filled" || state_str == "canceled";
+                            if is_terminal {
+                                if owns_order {
+                                    self.pipeline
+                                        .clear_dedup(&bot_id, &account_id, &pair, &order.client_order_id)
+                                        .await;
+                                }
+                                if let Some(cem) = self.pipeline.cem_manager() {
+                                    if owns_order {
+                                        cem.remove_preemption_cancel(&order.client_order_id).await;
+                                    }
+                                    if let Some((asset, amount, parked)) =
+                                        cem.complete_terminal_order(&order.client_order_id).await
+                                    {
+                                        if parked {
+                                            log::info!(
+                                                "🅿️ [CEM] Preempted order {} parked in CEM pool — {} {} released, waiting for reactivation",
+                                                order.client_order_id, amount, asset
+                                            );
+                                        } else {
+                                            log::info!(
+                                                "🔓 [CEM] Released {} {} from terminal order {} (state={})",
+                                                amount, asset, order.client_order_id, order.state
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                // order ยังไม่ terminal (live/partially_filled) -> ยืนยันกับ CEM ว่ามีตัวตน
+                                if let Some(cem) = self.pipeline.cem_manager() {
+                                    cem.mark_order_live(&order.client_order_id).await;
+                                }
+                            }
+
                             let actions = self.strategy_engine.on_order_update(&order);
                             self.process_strategy_actions(&bot_id, &account_id, &pair, actions)
                                 .await;
+
+                            // ปลุก Parked Orders ตาม priority หรือ trigger preemption ถ้ามี order เพิ่ง confirm live
+                            self.reevaluate_and_route().await;
 
                             // The OKX orders channel includes the latest execution on each
                             // fill update. Route it through the same strategy/persistence path.
@@ -452,15 +620,153 @@ impl BotExecutor {
                     }
                 }
 
-                // 5. Heartbeat ตรวจสอบความมีชีวิตของบอท
+                // 5. รับอัปเดตยอดเงินคงเหลือจาก Account Balance WebSocket
+                balance_result = balance_rx.recv() => {
+                    match balance_result {
+                        Ok(balance_update) => {
+                            if let Some(cem) = self.pipeline.cem_manager() {
+                                for detail in balance_update.details {
+                                    let avail_bal = Decimal::from_str(&detail.avail_bal).unwrap_or(Decimal::ZERO);
+                                    let total_eq = Decimal::from_str(&detail.eq).unwrap_or(avail_bal);
+                                    cem.update_balance_from_ws(&detail.ccy, avail_bal, total_eq).await;
+                                }
+
+                                // หลังอัปเดต balance ใหม่ -> ปลุกตาม priority แล้ว route กลับเจ้าของ
+                                self.reevaluate_and_route().await;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            log::warn!("[Bot #{}] ⚠️ Balance stream lagged by {} messages", bot_id, skipped);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            log::debug!("[Bot #{}] Balance stream closed", bot_id);
+                        }
+                    }
+                }
+
+                // 7. รับ Reactivated Order ที่ CEM route กลับมาให้วางใหม่ (บอทเจ้าของเท่านั้น)
+                reactivation = reactivation_rx.recv() => {
+                    if let Some(r_order) = reactivation {
+                        let actions = self.strategy_engine.on_cem_reactivate(&r_order);
+                        if actions.is_empty() {
+                            // Strategy ไม่รู้จักคำสั่งนี้ (เช่น รีสตาร์ทบอทแล้ว strategy state หาย)
+                            // -> เก็บกวาด entry + คืนเงินจอง กันเงินถูกจองค้างตาย
+                            if let Some(cem) = self.pipeline.cem_manager() {
+                                if let Some((asset, amount)) = cem.abandon_reactivated_order(&r_order.intent_id).await {
+                                    log::warn!(
+                                        "[Bot #{}] ⚠️ Reactivation abandoned for {} (strategy does not track it) — {} {} returned to free",
+                                        bot_id, r_order.intent_id, amount, asset
+                                    );
+                                }
+                            }
+                        } else {
+                            self.process_strategy_actions(&bot_id, &account_id, &pair, actions).await;
+                        }
+                    }
+                }
+
+                // 8. Trading op ack ระดับ item (เช่น cancel 51400 = order ไม่มีอยู่บน exchange แล้ว,
+                //    place sCode!=0 เช่น 51008 = order ไม่เคยถูกสร้างเลย)
+                //    order ที่ place ถูก reject จะไม่มี terminal event มาเอง -> ต้อง reconcile ด้วย ack นี้
+                //    (เคสจริง zzz.log 03:00:00: cancel preempt ของ reactivation ที่ไม่เคยถึง OKX -> 51400;
+                //     app_2026-10-13: place ของ BOT4d81... ถูก 51008 หลัง dispatch -> order ผี + dedup ค้าง -> ลูป)
+                ack_result = op_ack_rx.recv() => {
+                    match ack_result {
+                        Ok(ack) => {
+                            let place_rejected = ack.op == "order";
+                            let order_gone = ack.op.contains("cancel")
+                                && matches!(ack.s_code.as_str(), "51400" | "51603");
+
+                            if place_rejected {
+                                // เฉพาะ executor ของบอทเจ้าของ clOrdId เท่านั้น:
+                                // dedup cache และ strategy state เป็น instance ต่อ bot
+                                if self
+                                    .strategy_engine
+                                    .owns_client_order_id(&ack.cl_ord_id)
+                                {
+                                    // ล้าง dedup (ไม่งั้น clOrdId ถูก block ตลอดกาล) + คืน lock ของ CEM
+                                    // + ตั้ง backoff ห้าม reevaluate ปลุกซ้ำทันที (กันลูป 65 รอบ/วินาที)
+                                    let released = self
+                                        .pipeline
+                                        .handle_place_reject(
+                                            &bot_id, &account_id, &pair, &ack.cl_ord_id,
+                                        )
+                                        .await;
+                                    match released {
+                                        Some((asset, amount)) => log::warn!(
+                                            "[Bot #{}] ❌ Place rejected by OKX: clOrdId={} code={} msg='{}' — order never reached exchange; {} {} returned to CEM, retry delayed",
+                                            bot_id, ack.cl_ord_id, ack.s_code, ack.s_msg, amount, asset
+                                        ),
+                                        None => log::warn!(
+                                            "[Bot #{}] ❌ Place rejected by OKX: clOrdId={} code={} msg='{}' — order never reached exchange",
+                                            bot_id, ack.cl_ord_id, ack.s_code, ack.s_msg
+                                        ),
+                                    }
+                                    // Strategy ต้องเลิกถือว่า order นี้อยู่บน exchange (ไม่งั้น chase -> 51503
+                                    // และไม่มีใคร rebalance ฝั่งนี้) -> ย้ายกลับเป็น PARKED
+                                    self.strategy_engine
+                                        .on_place_rejected(&ack.cl_ord_id, &ack.s_msg);
+                                    self.reevaluate_and_route().await;
+                                }
+                            } else if order_gone {
+                                // CancelPending -> Parked + คืน lock (idempotent:
+                                // ถ้า terminal event มาทำไปแล้วจะเป็น no-op)
+                                let owns = self.strategy_engine.owns_client_order_id(&ack.cl_ord_id);
+                                if owns {
+                                    self.pipeline
+                                        .clear_dedup(&bot_id, &account_id, &pair, &ack.cl_ord_id)
+                                        .await;
+                                }
+                                if let Some((asset, amount, parked)) = self
+                                    .pipeline
+                                    .handle_cancel_gone(&bot_id, &account_id, &pair, &ack.cl_ord_id)
+                                    .await
+                                {
+                                    if parked {
+                                        log::info!(
+                                            "[Bot #{}] 🅿️ [CEM] Cancel ack {} ({}) — order not on exchange; {} {} returned, waiting for reactivation",
+                                            bot_id, ack.cl_ord_id, ack.s_code, amount, asset
+                                        );
+                                    } else {
+                                        log::info!(
+                                            "[Bot #{}] 🔓 [CEM] Cancel ack {} ({}) — released {} {} from order no longer on exchange",
+                                            bot_id, ack.cl_ord_id, ack.s_code, amount, asset
+                                        );
+                                    }
+                                    self.reevaluate_and_route().await;
+                                }
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            log::warn!("[Bot #{}] ⚠️ Op-ack stream lagged by {} messages", bot_id, skipped);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            log::debug!("[Bot #{}] Op-ack stream closed", bot_id);
+                        }
+                    }
+                }
+
+                // 6. Heartbeat ตรวจสอบความมีชีวิตของบอท
                 _ = heartbeat_timer.tick() => {
                     log::debug!("[Bot #{}] 💓 Executor heartbeat is alive", bot_id);
                 }
             }
         }
 
+        // ยกเลิก route และคืนเงินจองของคำสั่งที่ยังค้างในคิว (บอทหยุดแล้ว -> ปลุกกลับเป็น Parked)
+        if let Some(cem) = self.pipeline.cem_manager() {
+            cem.unregister_reactivation_route(&bot_id).await;
+            while let Ok(r_order) = reactivation_rx.try_recv() {
+                cem.unreserve_reactivated_order(&r_order.intent_id).await;
+            }
+        }
+
         let pending_orders = self.strategy_engine.pending_cancel_orders();
-        if !pending_orders.is_empty() {
+        // recovery_ok = เหตุผลที่ยืนยันแล้วว่า order ของ bot นี้ไม่ live บน exchange อีกต่อไป
+        // -> ค่อยปลดล็อก CEM ได้อย่างปลอดภัย (ถ้า recovery fail -> ห้ามปลด เพราะ order อาจยัง live)
+        let recovery_ok = if pending_orders.is_empty() {
+            true
+        } else {
             log::info!(
                 "[Bot #{}] 🛑 Stop cleanup: reconciling {} tracked order(s)",
                 bot_id,
@@ -480,12 +786,36 @@ impl BotExecutor {
             {
                 Ok(()) => {
                     let _ = self.persist_runtime_state(&bot_id).await;
+                    true
                 }
-                Err(err) => log::error!(
-                    "[Bot #{}] ❌ Stop cleanup recovery failed; tracked state retained: {}",
-                    bot_id,
-                    err
-                ),
+                Err(err) => {
+                    log::error!(
+                        "[Bot #{}] ❌ Stop cleanup recovery failed; tracked state retained: {}",
+                        bot_id,
+                        err
+                    );
+                    false
+                }
+            }
+        };
+
+        // เก็บกวาด CEM ของ bot ตัวเอง: ปลดล็อกปกติจะถูกทำโดย event loop ของ executor ที่ยังรันอยู่ —
+        // ถ้าเป็นบอทตัวสุดท้ายของ account ไม่มีใครประมวลผล terminal event ตอนนี้ -> lock ค้าง
+        // ข้าม restart (CemManager เป็น shared ต่อ account ระดับ process)
+        if let Some(cem) = self.pipeline.cem_manager() {
+            if recovery_ok {
+                let cleaned = cem.release_bot_orders_on_stop(&bot_id).await;
+                if cleaned > 0 {
+                    log::info!(
+                        "[Bot #{}] 🛑 Stop cleanup: released CEM state for {} order(s)",
+                        bot_id,
+                        cleaned
+                    );
+                }
+            }
+            // Invariant check (bug report ข้อ 5): จับ lock ลอย / free+used != total ตั้งแต่ตอน stop
+            for violation in cem.invariant_violations().await {
+                log::error!("[Bot #{}] ❌ CEM invariant violated at stop: {}", bot_id, violation);
             }
         }
 

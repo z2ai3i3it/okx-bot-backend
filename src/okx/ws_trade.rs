@@ -42,8 +42,19 @@ pub enum WsTradingOp {
     BatchCancelOrders(Vec<WsCancelOrderArg>),
 }
 
+/// Item-level ack ของ trading op ที่ OKX ตอบกลับ (sCode != 0)
+/// ใช้ให้ CEM reconcile ได้ทันที เช่น cancel ได้ 51400/51603 = order ไม่มีอยู่บน exchange แล้ว
+/// (โดยเฉพาะ order ที่ place ถูก reject ไปก่อน -> ไม่มี terminal event มาเอง ต้องใช้ ack นี้)
+#[derive(Debug, Clone)]
+pub struct WsOpAck {
+    pub op: String,
+    pub cl_ord_id: String,
+    pub s_code: String,
+    pub s_msg: String,
+}
+
 /// WebSocket Client สำหรับยิงคำสั่งซื้อขายความเร็วสูงและรับ Private Streams
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct OkxWsTradeClient {
     ws_url: String,
     trading_op_tx: mpsc::Sender<WsTradingOp>,
@@ -52,6 +63,8 @@ pub struct OkxWsTradeClient {
     orders_sender: broadcast::Sender<OkxOrderUpdateData>,
     my_trades_sender: broadcast::Sender<OkxMyTradeData>,
     balance_sender: broadcast::Sender<OkxAccountBalanceUpdate>,
+    /// Item-level failures ของ trading ops (เช่น cancel 51400) ให้ CEM/executor reconcile
+    op_ack_sender: broadcast::Sender<WsOpAck>,
 }
 
 impl OkxWsTradeClient {
@@ -62,6 +75,7 @@ impl OkxWsTradeClient {
         let (orders_sender, _) = broadcast::channel(1024);
         let (my_trades_sender, _) = broadcast::channel(1024);
         let (balance_sender, _) = broadcast::channel(512);
+        let (op_ack_sender, _) = broadcast::channel(256);
 
         let ws_url = if is_simulated {
             "wss://wspap.okx.com:8443/ws/v5/private?brokerId=9999".to_string()
@@ -75,6 +89,7 @@ impl OkxWsTradeClient {
             orders_sender,
             my_trades_sender,
             balance_sender,
+            op_ack_sender,
         };
 
         (client, trading_op_rx)
@@ -101,6 +116,11 @@ impl OkxWsTradeClient {
     /// ฟัง Balance & Margin สด (Balance stream)
     pub fn subscribe_balance(&self) -> broadcast::Receiver<OkxAccountBalanceUpdate> {
         self.balance_sender.subscribe()
+    }
+
+    /// ฟัง Item-level ack ของ trading ops (เช่น cancel ที่ได้ 51400 = order ไม่มีอยู่แล้ว)
+    pub fn subscribe_op_acks(&self) -> broadcast::Receiver<WsOpAck> {
+        self.op_ack_sender.subscribe()
     }
 
     // ==========================================
@@ -184,6 +204,7 @@ impl OkxWsTradeClient {
         let orders_sender = self.orders_sender.clone();
         let my_trades_sender = self.my_trades_sender.clone();
         let balance_sender = self.balance_sender.clone();
+        let op_ack_sender = self.op_ack_sender.clone();
 
         tokio::spawn(async move {
             let mut backoff_sec = 1u64;
@@ -256,13 +277,14 @@ impl OkxWsTradeClient {
                         let sub_msg = json!({
                             "op": "subscribe",
                             "args": [
-                                { "channel": "orders", "instType": "SPOT" }
+                                { "channel": "orders", "instType": "SPOT" },
+                                { "channel": "account" }
                             ]
                         });
                         if let Ok(s) = serde_json::to_string(&sub_msg) {
                             let _ = write.send(Message::Text(s.into())).await;
                         }
-                        log::info!("OKX Private WS: subscribed to orders channel");
+                        log::info!("OKX Private WS: subscribed to orders and account channels");
 
                         // --- Step 4: Main event loop ---
                         let mut ping_interval = interval(Duration::from_secs(20));
@@ -321,7 +343,7 @@ impl OkxWsTradeClient {
                                             if text == "pong" { continue; }
                                             if let Ok(val) = serde_json::from_str::<Value>(&text) {
                                                 Self::handle_private_message(
-                                                    &val, &orders_sender, &my_trades_sender, &balance_sender
+                                                    &val, &orders_sender, &my_trades_sender, &balance_sender, &op_ack_sender
                                                 );
                                             }
                                         }
@@ -364,6 +386,7 @@ impl OkxWsTradeClient {
         orders_sender: &broadcast::Sender<OkxOrderUpdateData>,
         my_trades_sender: &broadcast::Sender<OkxMyTradeData>,
         balance_sender: &broadcast::Sender<OkxAccountBalanceUpdate>,
+        op_ack_sender: &broadcast::Sender<WsOpAck>,
     ) {
         let channel = val
             .get("arg")
@@ -375,7 +398,9 @@ impl OkxWsTradeClient {
             log::debug!("📨 OKX raw orders payload: {}", val);
             if let Ok(data) = serde_json::from_value::<Vec<OkxOrderUpdateData>>(val["data"].clone()) {
                 for order in data {
-                    log::info!(
+                    // debug เพราะทุก bot เปิด private WS แยกกันบน account เดียวกัน -> event เดียวกัน
+                    // ถูก log ซ้ำ N เท่าของจำนวน connection (log ของเจ้าของ order ยังมีที่ strategy ระดับ INFO)
+                    log::debug!(
                         "📋 Order Update: {} {} {} @ {} → state={}",
                         order.inst_id, order.side, order.sz, order.px, order.state
                     );
@@ -410,6 +435,31 @@ impl OkxWsTradeClient {
             // Trade op ack (order/cancel result)
             let code = val.get("code").and_then(|v| v.as_str()).unwrap_or("");
             let msg = val.get("msg").and_then(|v| v.as_str()).unwrap_or("");
+
+            // Item-level failures (sCode != 0) -> broadcast ack ให้ subscriber (เช่น CEM ใช้ reconcile
+            // cancel 51400 = order ไม่มีอยู่แล้ว) — ไม่ว่า op-level code จะเป็น 0 หรือไม่
+            // (เคสจริง zzz.log 03:00:00.637 cancel 51400 มาพร้อม op-level code=1 -> ถ้ารอเฉพาะ code==0 จะตกหล่น)
+            if let Some(data_arr) = val.get("data").and_then(|d| d.as_array()) {
+                for item in data_arr {
+                    let s_code = item.get("sCode").and_then(|c| c.as_str()).unwrap_or("0");
+                    if s_code != "0" {
+                        let _ = op_ack_sender.send(WsOpAck {
+                            op: op.as_str().unwrap_or("?").to_string(),
+                            cl_ord_id: item
+                                .get("clOrdId")
+                                .and_then(|c| c.as_str())
+                                .unwrap_or("-")
+                                .to_string(),
+                            s_code: s_code.to_string(),
+                            s_msg: item
+                                .get("sMsg")
+                                .and_then(|m| m.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        });
+                    }
+                }
+            }
             if code == "0" {
                 // เช็คว่าใน data array มี sCode != "0" หรือไม่
                 if let Some(data_arr) = val.get("data").and_then(|d| d.as_array()) {
@@ -418,7 +468,18 @@ impl OkxWsTradeClient {
                         let s_msg = item.get("sMsg").and_then(|m| m.as_str()).unwrap_or("");
                         let cl_ord_id = item.get("clOrdId").and_then(|c| c.as_str()).unwrap_or("-");
                         if s_code != "0" {
-                            log::error!("❌ OKX WS op='{}' item error: clOrdId={} code={} msg='{}'", op.as_str().unwrap_or("?"), cl_ord_id, s_code, s_msg);
+                            let op_name = op.as_str().unwrap_or("?");
+                            // Cancel ที่ได้ 51400/51603 = order ไม่มีอยู่แล้วบน exchange (terminal ไปก่อน)
+                            // เป็น flow ปกติของ recovery กวาด order เก่า / preempt cancel ที่ซ้อนกับ terminal event
+                            // -> ไม่ใช่ error (แต่ถ้าเป็น fill/partial-fill ที่ผิดพลาดต้องยังเป็น error เหมือนเดิม)
+                            if op_name.contains("cancel") && matches!(s_code, "51400" | "51603") {
+                                log::info!(
+                                    "ℹ️ OKX WS op='{}' order already gone: clOrdId={} code={}",
+                                    op_name, cl_ord_id, s_code
+                                );
+                            } else {
+                                log::error!("❌ OKX WS op='{}' item error: clOrdId={} code={} msg='{}'", op_name, cl_ord_id, s_code, s_msg);
+                            }
                         } else {
                             log::info!("✅ OKX WS op='{}' success: clOrdId={}", op.as_str().unwrap_or("?"), cl_ord_id);
                         }
@@ -427,8 +488,121 @@ impl OkxWsTradeClient {
                     log::info!("✅ OKX WS op='{}' success", op.as_str().unwrap_or("?"));
                 }
             } else {
-                log::error!("❌ OKX WS op='{}' failed: {} (code={}) full={:?}", op.as_str().unwrap_or("?"), msg, code, val);
+                // op-level code != 0 แต่ item-level บอก cancel 51400/51603 ทุกตัว
+                // = order ไม่มีอยู่บน exchange แล้ว (race กับ terminal event / recovery กวาด order เก่า)
+                // -> flow ปกติ -> WARN สั้น ไม่พิมพ์ JSON dump (กัน log ท่วม เคส zzz.log มี 13 ERROR/90 วินาที)
+                let op_name = op.as_str().unwrap_or("?");
+                let data = val.get("data").and_then(|d| d.as_array());
+                let benign_cancel_gone = op_name.contains("cancel")
+                    && data.map_or(false, |items| {
+                        !items.is_empty()
+                            && items.iter().all(|item| {
+                                matches!(
+                                    item.get("sCode").and_then(|c| c.as_str()),
+                                    Some("51400" | "51603")
+                                )
+                            })
+                    });
+                if benign_cancel_gone {
+                    let items = data.expect("benign_cancel_gone implies data exists");
+                    let cl_ord_id = items[0].get("clOrdId").and_then(|c| c.as_str()).unwrap_or("-");
+                    let s_code = items[0].get("sCode").and_then(|c| c.as_str()).unwrap_or("?");
+                    log::warn!(
+                        "⚠️ OKX WS op='{}' order already gone: clOrdId={} code={} (benign — order terminal ไปก่อนหน้านี้แล้ว)",
+                        op_name, cl_ord_id, s_code
+                    );
+                } else {
+                    log::error!("❌ OKX WS op='{}' failed: {} (code={}) full={:?}", op_name, msg, code, val);
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ยืนยันว่า item-level failure (sCode != 0) ถูก broadcast เป็น WsOpAck ทั้งสองเคส:
+    /// - op-level code=1 พร้อม item sCode != 0 (รูปแบบจริงจาก zzz.log 03:00:00.637 cancel 51400)
+    /// - op-level code=0 แต่ item sCode != 0
+    /// และ sCode=0 ห้ามส่ง ack
+    #[test]
+    fn handle_private_message_broadcasts_item_level_op_acks() {
+        let (orders_sender, _rx) = broadcast::channel(16);
+        let (trades_sender, _rx) = broadcast::channel(16);
+        let (balance_sender, _rx) = broadcast::channel(16);
+        let (ack_sender, mut ack_rx) = broadcast::channel(16);
+
+        // เคส 1: op-level code=1 + item sCode=51400 (รูปแบบจริงจาก OKX demo)
+        let val: serde_json::Value = serde_json::json!({
+            "id": "1d5d23e9a51e4d119d4da7c6ecaad174",
+            "op": "cancel-order",
+            "code": "1",
+            "msg": "",
+            "data": [{
+                "ordId": "",
+                "clOrdId": "BOTf98ec14c8439470cb06eeebbce3ca",
+                "sCode": "51400",
+                "sMsg": "Order cancellation failed as the order has been filled, canceled or does not exist."
+            }]
+        });
+        OkxWsTradeClient::handle_private_message(
+            &val, &orders_sender, &trades_sender, &balance_sender, &ack_sender,
+        );
+        let ack = ack_rx.try_recv().expect("ต้องได้ ack จาก op-level code=1");
+        assert_eq!(ack.op, "cancel-order");
+        assert_eq!(ack.cl_ord_id, "BOTf98ec14c8439470cb06eeebbce3ca");
+        assert_eq!(ack.s_code, "51400");
+
+        // เคส 2: op-level code=0 แต่ item sCode != 0
+        let val2: serde_json::Value = serde_json::json!({
+            "id": "abc",
+            "op": "cancel-order",
+            "code": "0",
+            "data": [{ "clOrdId": "BOT-cancel-2", "sCode": "51603", "sMsg": "Order does not exist" }]
+        });
+        OkxWsTradeClient::handle_private_message(
+            &val2, &orders_sender, &trades_sender, &balance_sender, &ack_sender,
+        );
+        let ack2 = ack_rx.try_recv().expect("ต้องได้ ack จาก op-level code=0");
+        assert_eq!(ack2.cl_ord_id, "BOT-cancel-2");
+        assert_eq!(ack2.s_code, "51603");
+
+        // เคส 3: place ถูกปฏิเสธหลัง dispatch (op='order', sCode=51008 — payload จริงจาก
+        // app_2026-10-13_03-55: BOT4d81... insufficient SUI balance) ต้อง broadcast ack ด้วย
+        // (ไม่งั้น executor ไม่มีทางคืน lock / ล้าง dedup -> order ผี + ลูป reactivate)
+        let val4: serde_json::Value = serde_json::json!({
+            "id": "694b414aa5674cf1bda4da3866f8a7ca",
+            "op": "order",
+            "code": "1",
+            "msg": "",
+            "data": [{
+                "ordId": "",
+                "clOrdId": "BOT4d81b438a42342219e3059fc79fe9",
+                "sCode": "51008",
+                "sMsg": "Order failed. Insufficient SUI balance in account.",
+                "subCode": "1000"
+            }]
+        });
+        OkxWsTradeClient::handle_private_message(
+            &val4, &orders_sender, &trades_sender, &balance_sender, &ack_sender,
+        );
+        let ack4 = ack_rx.try_recv().expect("place reject (op=order) ต้อง broadcast ack");
+        assert_eq!(ack4.op, "order");
+        assert_eq!(ack4.cl_ord_id, "BOT4d81b438a42342219e3059fc79fe9");
+        assert_eq!(ack4.s_code, "51008");
+
+        // success item (sCode=0) ห้าม broadcast ack
+        let val3: serde_json::Value = serde_json::json!({
+            "id": "def",
+            "op": "cancel-order",
+            "code": "0",
+            "data": [{ "clOrdId": "BOT-ok", "sCode": "0", "sMsg": "" }]
+        });
+        OkxWsTradeClient::handle_private_message(
+            &val3, &orders_sender, &trades_sender, &balance_sender, &ack_sender,
+        );
+        assert!(ack_rx.try_recv().is_err(), "sCode=0 ห้ามส่ง ack");
     }
 }
