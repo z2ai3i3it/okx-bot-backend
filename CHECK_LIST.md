@@ -499,12 +499,22 @@
         - ตรวจสอบว่าทุก Event ที่เงินหลุด (Cancel / Fill / Live Preemption) ยังคงทริกเกอร์ `reevaluate_and_route()` ได้ครบถ้วน 100% ไม่มีออเดอร์ค้างใน Parked
 
     - [ ] **11.5 Advanced Micro-Optimizations (แนวคิดต่อยอดขั้นสูง / HFT Techniques):**
-      - [ ] **11.5.1 Batch Cancel WebSocket Operation (`batch-cancel-orders`):**
-        - ปรับปรุงจังหวะ Preemption หรือ Stop Cleanup ที่ต้องยกเลิกหลายคำสั่งพร้อมกัน ให้ใช้ OKX Private WebSocket op `batch-cancel-orders` ส่งอาเรย์คำสั่งสูงสุด 20 รายการใน 1 JSON Frame เดียว เพื่อตัดปัญหา Network Round-Trip ซ้ำซ้อนและลด Lock บน Socket
+      - [x] **11.5.1 Batch Cancel WebSocket Operation (`batch-cancel-orders`):**
+        - ปรับปรุงจังหวะ Preemption และ Stop Recovery Cleanup ให้ใช้ `cancel_orders_ws` ส่งอาเรย์คำสั่งยกเลิกใน 1 JSON Frame เดียว ช่วยตัด Network Round-Trip ซ้ำซ้อนและลด Lock บน Socket
       - [ ] **11.5.2 Lockless Free Balance via Atomic Raw Decimals:**
         - ใช้ตัวแปรระดับ Atomic (`AtomicU64` / CAS) สำหรับตรวจสอบและจอง Free Balance เบื้องต้น (Fast-path) แทนการเข้าคิวรอ Async Mutex ช่วยลด Latency การตรวจเงินลงเหลือระดับ Nanosecond
       - [ ] **11.5.3 Pre-allocated / Templated JSON Serialization:**
         - ปรับลด Serialization Overhead ของ `serde_json` ใน `okx_executor.rs` โดยการใช้ Byte Template หรือ Buffer Pre-allocation สำหรับโครงสร้างคำสั่ง Place/Cancel ของ OKX
+      - [x] **11.5.4 In-Flight Abort / Preemption Drop Guard (`is_preempted_or_cancelled`):**
+        - ถอดบทเรียนจาก Queue-Drop ใน Legacy Python: เพิ่ม Guard ตรวจสอบใน `OrderPipeline` ก่อนส่งคำสั่งลง WebSocket จริงในขั้นตอนสุดท้าย
+        - หากตรวจพบว่าออเดอร์ถูก Preempt/Cancel ตัดหน้าในเสี้ยววินาทีเดียวกัน จะสั่ง Abort ทันทีโดยไม่ยิงคำสั่งออกเน็ตเวิร์ก
+        - ส่งผลลัพธ์ย้อนกลับไปยัง Strategy Engine ทันทีเพื่อให้ย้ายสถานะออเดอร์เข้า **PARKED** อย่างสมบูรณ์ ป้องกันการเกิด Phantom Order บน Strategy, ป้องกัน Error 51503 จากการ Chase/Cancel ซ้ำ และคืน Reservation Balance สู่ CEM โดยไม่ต้องยิง Fake Event เหมือน Python
+        - *(Bug Fix)*: แก้ไขจังหวะ Re-evaluation ปลุก Parked Order กลับมาวางใหม่ ให้ล้าง `planned_preemption_cancels` ออกจาก ID ทันทีที่ Approved ป้องกันไม่ให้ออเดอร์ที่ถูกปลุกเข้าใจผิดว่าตนเองถูกยกเลิกตัดหน้าจนเกิด In-Flight Abort ซ้ำซาก
+      - [ ] **11.5.5 Batch Place Order (`batch-orders`) สำหรับขยายขีดจำกัด Rate Limit:**
+        - สำหรับรองรับการทดสอบสเกลใหญ่ (เช่น บอท 10-20 ตัวรันพร้อมกันบนคู่เดียว หรือตั้ง Threshold แคบจนเกิด High Frequency Rebalance):
+        - ประโยชน์: ขยายเพดาน Rate Limit ของ OKX จาก 60 req/2s (Single) เป็น 300 req/2s (Batch) และส่งได้สูงสุด 20 คำสั่งต่อ 1 Frame
+        - *ข้อควรระวัง/ความเสี่ยงสูง (High Complexity):* ต้องออกแบบ Transaction Rollback รองรับกรณี Partial Rejection (เช่น ส่ง Buy+Sell ไปพร้อมกัน แต่ Buy สำเร็จ Sell โดนปฏิเสธ) เพื่อไม่ให้เกิด Capital Desynchronization และต้องคืนสถานะกลับ Strategy อย่างถูกต้อง
+
 
 
 

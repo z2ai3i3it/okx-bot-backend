@@ -571,6 +571,10 @@ impl CemManager {
                     reactivated.push(target.clone());
                 }
 
+                // ลบออกจาก planned_preemption_cancels (หากเคยติด flag preemption cancel มาก่อน)
+                // เพื่อให้ออเดอร์ที่ถูกปลุกกลับมาวางใหม่ไม่ถูก In-Flight Abort Guard บล็อก
+                self.planned_preemption_cancels.lock().await.remove(&order.intent_id);
+
                 log::info!(
                     "[CEM] 🚀 [Reactivate] Parked order {} (bot: {}) APPROVED! Locked {} {}. Remaining free: {}",
                     order.intent_id, order.bot_id, order.locked_amount, order.required_asset, entry.free
@@ -758,7 +762,32 @@ impl CemManager {
             intent_id, amount, asset_key
         );
     }
-}impl CemStep {
+
+    /// ตรวจสอบว่า order intent ถูก Preempt หรือถูกสั่ง Cancel ตัดหน้าไปแล้วหรือไม่
+    pub async fn is_preempted_or_cancelled(&self, intent_id: &str) -> bool {
+        if self.planned_preemption_cancels.lock().await.contains(intent_id) {
+            return true;
+        }
+        let pool = self.tracked_orders.lock().await;
+        if let Some(order) = pool.get(intent_id) {
+            return matches!(
+                order.status,
+                crate::pipeline::simulate_cancel_plan::IntentStatus::CancelPending
+                    | crate::pipeline::simulate_cancel_plan::IntentStatus::Parked
+            );
+        }
+        false
+    }
+}
+
+impl CemStep {
+    /// ตรวจสอบว่า order ถูก Preempt หรือ Cancel ตัดหน้าก่อนส่งลง WebSocket หรือไม่
+    pub async fn is_preempted_or_cancelled(&self, intent_id: &str) -> bool {
+        match &self.manager {
+            Some(manager) => manager.is_preempted_or_cancelled(intent_id).await,
+            None => false,
+        }
+    }
     /// Delegate: คืนเงินจองเมื่อ place ถูกปฏิเสธหลังจอง (ไม่ทำอะไรถ้าไม่ได้ inject manager)
     pub async fn revert_reservation(&self, intent_id: &str) -> Option<(String, Decimal)> {
         match &self.manager {

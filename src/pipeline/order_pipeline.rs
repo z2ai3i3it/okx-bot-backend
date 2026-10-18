@@ -82,6 +82,18 @@ impl OrderPipeline {
             // Step 3: Rate Limiter
             self.rate_limit.execute(&mut ctx).await?;
 
+            // 11.5.4 In-Flight Abort Guard: ตรวจสอบระดับ Nanosecond ก่อนส่งคำสั่งลง WebSocket
+            // ถ้าออเดอร์ถูก Preempt หรือถูกสั่ง Cancel ตัดหน้าในเสี้ยววินาที ให้ abort ทันที
+            if self.cem.is_preempted_or_cancelled(&ctx.client_order_id).await {
+                let reason = format!(
+                    "Order {} was preempted/cancelled in-flight before socket write — aborting placement",
+                    ctx.client_order_id
+                );
+                log::info!("[Bot #{}] 🚫 [In-Flight Abort] {}", bot_id, reason);
+                ctx.reject(reason.clone());
+                return Err(reason);
+            }
+
             // Step 4: OKX WS Executor
             self.executor.execute(&mut ctx).await?;
 
@@ -158,6 +170,7 @@ impl OrderPipeline {
             .remove(bot_id, account_id, inst_id, cl_ord_id)
             .await;
         let cem = self.cem_manager()?;
+        cem.remove_preemption_cancel(cl_ord_id).await;
         cem.complete_terminal_order(cl_ord_id).await
     }
 
@@ -432,5 +445,50 @@ mod tests {
             res.is_ok(),
             "re-place หลัง cancel 51400 ต้องผ่าน DedupStep: {res:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_in_flight_abort_does_not_block_reactivated_preempted_order() {
+        use crate::pipeline::simulate_cancel_plan::TrackedOrderForCem;
+        // จำลองเคสจริง: Order เคยถูก Mark Preemption Cancel
+        // แต่เมื่อเงินพอ CEM นำกลับมา Reactivate -> ต้องวางผ่าน ไม่โดน In-Flight Abort บล็อก
+        let cem = CemManager::new();
+        cem.update_balance_from_ws("SUI", dec!(0.0), dec!(20.0)).await;
+
+        let cl_ord_id = "bot3_sell_preempted";
+        let bot_id = "bot-3";
+
+        // 1. Order ถูก Track เป็น Parked
+        cem.track_order(TrackedOrderForCem {
+            intent_id: cl_ord_id.to_string(),
+            bot_id: bot_id.to_string(),
+            symbol: "SUI-USDT".to_string(),
+            required_asset: "SUI".to_string(),
+            locked_amount: dec!(10.0),
+            price: dec!(1.5),
+            cem_priority: None,
+            can_be_canceled: true,
+            status: crate::pipeline::simulate_cancel_plan::IntentStatus::Parked,
+            created_at: None,
+            inst_id_code: None,
+            live_confirmed: false,
+        }).await;
+
+        // 2. เคยถูก mark preemption cancel ค้างไว้
+        cem.mark_preemption_cancel(cl_ord_id).await;
+        assert!(cem.is_planned_preemption_cancel(cl_ord_id).await);
+
+        // 3. ปล่อยเงินคืนเข้าระบบ SUI free = 20.0
+        cem.update_balance_from_ws("SUI", dec!(20.0), dec!(20.0)).await;
+
+        // 4. reevaluate_parked_orders ปลุกออเดอร์กลับมา
+        let reactivated = cem.reevaluate_parked_orders().await;
+        assert_eq!(reactivated.len(), 1);
+        assert_eq!(reactivated[0].intent_id, cl_ord_id);
+
+        // 5. ตรวจสอบว่า flag planned_preemption_cancels ถูกล้างออกแล้ว
+        assert!(!cem.is_planned_preemption_cancel(cl_ord_id).await);
+        // และ is_preempted_or_cancelled ต้องคืน false ทันที เพื่อให้ pipeline ยิงผ่าน
+        assert!(!cem.is_preempted_or_cancelled(cl_ord_id).await);
     }
 }

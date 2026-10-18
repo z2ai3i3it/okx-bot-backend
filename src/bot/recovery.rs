@@ -41,17 +41,29 @@ impl RecoveryEngine {
         }
 
         log::info!(
-            "[Bot #{}] 🧹 Dispatching cancel for {} tracked order(s)...",
+            "[Bot #{}] 🧹 Dispatching batch cancel for {} tracked order(s)...",
             bot_id,
             orders.len()
         );
-        for cancel_arg in orders {
+        if orders.len() == 1 {
+            let cancel_arg = &orders[0];
             let cl_ord_id = cancel_arg.client_order_id.as_deref().unwrap_or("-");
             if let Err(err) = trade_client.cancel_order_ws(cancel_arg.clone()).await {
                 let message = format!(
                     "[Bot #{}] Failed to dispatch cancel for clOrdId {}: {}",
                     bot_id,
                     cl_ord_id,
+                    err
+                );
+                log::error!("{}", message);
+                return Err(RecoveryError::CancelError(message));
+            }
+        } else {
+            if let Err(err) = trade_client.cancel_orders_ws(orders.to_vec()).await {
+                let message = format!(
+                    "[Bot #{}] Failed to dispatch batch cancel for {} orders: {}",
+                    bot_id,
+                    orders.len(),
                     err
                 );
                 log::error!("{}", message);
