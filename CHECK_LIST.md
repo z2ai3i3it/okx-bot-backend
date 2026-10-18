@@ -479,8 +479,16 @@
       - [ ] ลดการ `.clone()` ออเดอร์ทั้ง Struct ใน `reevaluate_parked_orders` และ `simulate_cancel_plan`
       - [ ] ใช้ Index / Key References หรือ SmallVec ในการประมวลผล Sorting แทนการ allocate `Vec<TrackedOrderForCem>` ใหม่ทุก Tick
       - *ระวัง Race Condition:* หากใช้ Reference อ้างอิง Index ต้องระวังการ Lock Pool ให้ครอบคลุม ไม่ให้อีก Thread หนึ่งลบหรือย้ายสถานะออเดอร์ใน Pool ระหว่างกำลังวนลูปประเมิน
-    - [ ] **11.3 (พักการทำ Fast-track Bypass / คงสถาปัตยกรรมเดิมไว้):**
-      - *ข้อสรุป:* ไม่ทำ Fast-track ยิงตรงจาก CEM เข้า WebSocket เพื่อป้องกันปัญหา State หลุดระหว่าง Strategy กับ CEM (รักษา Single Source of Truth และป้องกัน Duplicate / Ghost Order บนกระดาน)
+    - [ ] **11.3 In-Step Latency Optimization (รีดประสิทธิภาพภายใน Pipeline โดยไม่ Bypass):**
+      - *ข้อสรุป/ข้อควรระวังเดิม (พักการทำ Fast-track Bypass ไว้):* ไม่ทำ Fast-track ยิงตรงจาก CEM เข้า WebSocket ข้ามหัว Strategy เพื่อป้องกันปัญหา State หลุดระหว่าง Strategy กับ CEM (รักษา Single Source of Truth และป้องกัน Duplicate / Ghost Order บนกระดาน)
+      - [x] **11.3.1 CEM Gatekeeper Early Exit (ย้าย Reactivation Check ขึ้นมาหัวฟังก์ชัน):**
+        - ใน `cem_step.rs` ปัจจุบันมี lock `mid_prices` และคำนวณ distance ก่อนที่จะเช็ค `existing.status == Approved`
+        - ปรับให้เช็คสถานะ Approved ของ Reactivated Order เป็นลำดับแรกสุด ถ้าใช่ให้ผ่านทันทีโดยไม่ต้องแตะ Lock ของ Mid Price และไม่ต้องคำนวณ Distance ซ้ำซ้อน (ลดเวลาประมวลผลไป ~1-2 ms)
+      - [x] **11.3.2 Dedup Step Hash Optimization:**
+        - ปรับปรุงการตรวจสอบ Duplicate ใน `dedup.rs` ให้ lookup ด้วย `cl_ord_id` ตรงๆ เพื่อหลีกเลี่ยงการ allocate String ขนาดใหญ่ (`format!("{}:{}:{}:{}", ...)`) บน Heap ในทุก Order Attempt
+      - [ ] **11.3.3 Concurrent Reactivation Routing (`executor.rs`):**
+        - ปรับ `reevaluate_and_route()` ใน `executor.rs` กรณีที่มีหลายออเดอร์ได้รับการอนุมัติพร้อมกัน ให้ dispatch ส่งต่อเข้า Strategy แบบ Concurrent/Join แทนการรอ sequential await ทีละตัว
+        - *Note/ข้อควรระวัง:* อาจมีวิธีการหรือ logic อื่นช่วยให้สำเร็จได้ แต่การยิงแบบ Concurrent อาจทำให้ลำดับคิว (Priority Sequencing) สลับกันบน Network หรือแย่ง Channel WebSocket เส้นเดียวกัน การคง sequential routing ไว้ในปัจจุบันจึงมีความเสถียร แม่นยำตามลำดับ LIFO/Priority มากกว่า แม้จะใช้เวลาบวกสะสมเพิ่มขึ้นเล็กน้อยก็ตาม
     - [x] **11.4 Event-Driven Optimization (ตัด Reevaluate ซ้ำซ้อนออกจากรอบ Market Ticker):**
       - [x] **11.4.1 Remove `reevaluate_and_route()` from Ticker Loop (`executor.rs`):**
         - ตัดการเรียก `reevaluate_and_route()` ออกจากจังหวะรับ Ticker Update เนื่องจากราคาตลาดไม่กระทบต่อยอดเหรียญ (Balance) และจุดที่สถานะเงินเปลี่ยน (Cancel, Fill, Balance WS, Live) มีตัวเรียก Reevaluate รองรับอยู่ครบถ้วนแล้ว
@@ -489,5 +497,14 @@
         - คงระดับ Log `log::warn!` ไว้ตามเดิม เพื่อใช้ในการสังเกตการณ์ Flow และตรวจจับพฤติกรรมการ Fallback เมื่อทดสอบระบบจริง (เนื่องจากการตัด Reevaluate ออกจากรอบ Ticker ใน 11.4.1 ช่วยหยุดการเด้งรัวๆ ของ Log นี้ไปแล้ว)
       - [x] **11.4.3 Race Condition Safety Verification:**
         - ตรวจสอบว่าทุก Event ที่เงินหลุด (Cancel / Fill / Live Preemption) ยังคงทริกเกอร์ `reevaluate_and_route()` ได้ครบถ้วน 100% ไม่มีออเดอร์ค้างใน Parked
+
+    - [ ] **11.5 Advanced Micro-Optimizations (แนวคิดต่อยอดขั้นสูง / HFT Techniques):**
+      - [ ] **11.5.1 Batch Cancel WebSocket Operation (`batch-cancel-orders`):**
+        - ปรับปรุงจังหวะ Preemption หรือ Stop Cleanup ที่ต้องยกเลิกหลายคำสั่งพร้อมกัน ให้ใช้ OKX Private WebSocket op `batch-cancel-orders` ส่งอาเรย์คำสั่งสูงสุด 20 รายการใน 1 JSON Frame เดียว เพื่อตัดปัญหา Network Round-Trip ซ้ำซ้อนและลด Lock บน Socket
+      - [ ] **11.5.2 Lockless Free Balance via Atomic Raw Decimals:**
+        - ใช้ตัวแปรระดับ Atomic (`AtomicU64` / CAS) สำหรับตรวจสอบและจอง Free Balance เบื้องต้น (Fast-path) แทนการเข้าคิวรอ Async Mutex ช่วยลด Latency การตรวจเงินลงเหลือระดับ Nanosecond
+      - [ ] **11.5.3 Pre-allocated / Templated JSON Serialization:**
+        - ปรับลด Serialization Overhead ของ `serde_json` ใน `okx_executor.rs` โดยการใช้ Byte Template หรือ Buffer Pre-allocation สำหรับโครงสร้างคำสั่ง Place/Cancel ของ OKX
+
 
 

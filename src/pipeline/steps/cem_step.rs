@@ -864,6 +864,26 @@ impl CemStep {
                 (base, size_dec)
             };
 
+            // Reactivation path: เงินถูกจองไว้แล้วโดย `reevaluate_parked_orders`
+            // -> ปล่อยผ่านทันที (Early Exit) โดยไม่ต้อง lock mid_prices หรือคำนวณ distance ซ้ำซ้อน
+            {
+                let pool = manager.tracked_orders.lock().await;
+                if let Some(existing) = pool.get(&ctx.client_order_id) {
+                    if existing.status
+                        == crate::pipeline::simulate_cancel_plan::IntentStatus::Approved
+                    {
+                        log::info!(
+                            "[Bot #{}] 🛡️ [CEM Gatekeeper] Reactivated order {} already reserved {} {} — passing without re-lock",
+                            ctx.bot_id,
+                            ctx.client_order_id,
+                            existing.locked_amount,
+                            existing.required_asset
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+
             // Fast Path: ล็อก แบบ atomic กับการตรวจเงิน (กัน race กับ reevaluate/terminal release
             // ของบอทอื่น) — เดิมเช็ค `current_free` ก่อนแล้วค่อย lock ทีหลังโดยละเลยผลลัพธ์
             // -> ถ้าเงินถูกแย่งไป lock ไม่สำเร็จ แต่ยัง approve + track เป็น Approved (order ผี)
@@ -888,26 +908,6 @@ impl CemStep {
                     }
                 }
             };
-
-            // Reactivation path: เงินถูกจองไว้แล้วโดย `reevaluate_parked_orders`
-            // -> ปล่อยผ่านโดยไม่ lock ซ้ำ (ไม่งั้นเงินจะถูกจอง 2 รอบ -> free หายไปเฉยๆ)
-            {
-                let pool = manager.tracked_orders.lock().await;
-                if let Some(existing) = pool.get(&ctx.client_order_id) {
-                    if existing.status
-                        == crate::pipeline::simulate_cancel_plan::IntentStatus::Approved
-                    {
-                        log::info!(
-                            "[Bot #{}] 🛡️ [CEM Gatekeeper] Reactivated order {} already reserved {} {} — passing without re-lock",
-                            ctx.bot_id,
-                            ctx.client_order_id,
-                            existing.locked_amount,
-                            existing.required_asset
-                        );
-                        return Ok(());
-                    }
-                }
-            }
 
             if manager
                 .try_fast_approve(TrackedOrderForCem {

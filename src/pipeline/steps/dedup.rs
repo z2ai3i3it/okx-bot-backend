@@ -10,7 +10,7 @@ use crate::{
 /// Step 1: Dedup Step - ป้องกันการยิงคำสั่งที่มี clOrdId ซ้ำเข้าสู่ระบบ
 #[derive(Clone, Default)]
 pub struct DedupStep {
-    seen_place_order_ids: Arc<Mutex<HashSet<(String, String, String, String)>>>,
+    seen_place_order_ids: Arc<Mutex<HashSet<String>>>,
 }
 
 impl DedupStep {
@@ -20,15 +20,9 @@ impl DedupStep {
         }
     }
 
-    pub async fn remove(&self, bot_id: &str, account_id: &str, inst_id: &str, cl_ord_id: &str) {
-        let key = (
-            bot_id.to_string(),
-            account_id.to_string(),
-            inst_id.to_string(),
-            cl_ord_id.to_string(),
-        );
+    pub async fn remove(&self, _bot_id: &str, _account_id: &str, _inst_id: &str, cl_ord_id: &str) {
         let mut seen = self.seen_place_order_ids.lock().await;
-        seen.remove(&key);
+        seen.remove(cl_ord_id);
     }
 
     pub async fn execute(&self, ctx: &mut PipelineContext) -> Result<(), String> {
@@ -36,15 +30,9 @@ impl DedupStep {
             return Ok(());
         }
 
-        let key = (
-            ctx.bot_id.clone(),
-            ctx.account_id.clone(),
-            ctx.inst_id.clone(),
-            ctx.client_order_id.clone(),
-        );
         let mut seen = self.seen_place_order_ids.lock().await;
 
-        if !seen.insert(key) {
+        if !seen.insert(ctx.client_order_id.clone()) {
             let reason = format!(
                 "Duplicate place-order client_order_id '{}' detected by DedupStep",
                 ctx.client_order_id
