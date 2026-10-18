@@ -466,3 +466,28 @@
       - ทำให้เมื่อออเดอร์ตัวไกล (เช่น Bot #3) เพิ่งได้รับการยืนยันว่า Live บนกระดาน ระบบจะตรวจพบทันทีว่ามีออเดอร์ตัวใกล้ (Bot #2) ที่ Parked รออยู่ และส่งคำสั่ง Cancel Bot #3 เพื่อเคลียร์ทางให้ Bot #2 เข้ามาวางแทนทันที
     - [x] **10.7.3 Unit Test Coverage (`cem_step.rs`):**
       - เพิ่มเทสต์ `test_parked_order_triggers_preemption_when_new_order_becomes_live` ยืนยันว่าเมื่อ Bot #3 กลายเป็น Live ระบบจะทริกเกอร์ Preemption ให้ Bot #2 เข้ามาวางแทนได้อย่างสมบูรณ์แบบ
+
+  - [ ] **11. Performance Optimization & Low-Latency Tuning (เป้าหมาย Sub-millisecond)**
+    > [!CAUTION]
+    > **⚠️ ข้อควรระวังสูงสุด: ปัญหา Race Condition!**
+    > การปรับปรุงความเร็วระดับ Microsecond เช่น การลด Lock, การทำ Fast-track Bypass, หรือการใช้ Dirty Flags ห้ามกระทบต่อ Data Consistency และความถูกต้องของการจัดสรรเงินทุน (Virtual Lock / Free Balance) เป็นอันขาด หากเกิด Race Condition อาจทำให้เกิดการวางออเดอร์เกินทุนจริง (Over-allocation) บน Exchange หรือเกิดสถานะ Deadlock/Ghost Order ค้างในระบบ
+    
+    - [ ] **11.1 ลด Lock Contention บน Data Path หลัก (Read-Heavy Optimization):**
+      - [ ] แยก `mid_prices` ออกจาก Async Mutex ไปใช้ `parking_lot::RwLock` หรือ `arc_swap::ArcSwap` เพื่อให้อ่านราคา Mid Price สำหรับคำนวณ Distance ได้แบบ Zero-wait / Lock-free
+      - *ระวัง Race Condition:* การอ่าน Mid Price ขณะที่มีการเขียนอัปเดต ต้องมั่นใจว่าเป็น Atomic Read เสมอ เพื่อไม่ให้ได้ค่าราคาครึ่งๆ กลางๆ (Torn Read)
+    - [ ] **11.2 Zero-Copy & Heap Allocation Reduction (ลด Overhead Memory):**
+      - [ ] ลดการ `.clone()` ออเดอร์ทั้ง Struct ใน `reevaluate_parked_orders` และ `simulate_cancel_plan`
+      - [ ] ใช้ Index / Key References หรือ SmallVec ในการประมวลผล Sorting แทนการ allocate `Vec<TrackedOrderForCem>` ใหม่ทุก Tick
+      - *ระวัง Race Condition:* หากใช้ Reference อ้างอิง Index ต้องระวังการ Lock Pool ให้ครอบคลุม ไม่ให้อีก Thread หนึ่งลบหรือย้ายสถานะออเดอร์ใน Pool ระหว่างกำลังวนลูปประเมิน
+    - [ ] **11.3 (พักการทำ Fast-track Bypass / คงสถาปัตยกรรมเดิมไว้):**
+      - *ข้อสรุป:* ไม่ทำ Fast-track ยิงตรงจาก CEM เข้า WebSocket เพื่อป้องกันปัญหา State หลุดระหว่าง Strategy กับ CEM (รักษา Single Source of Truth และป้องกัน Duplicate / Ghost Order บนกระดาน)
+    - [x] **11.4 Event-Driven Optimization (ตัด Reevaluate ซ้ำซ้อนออกจากรอบ Market Ticker):**
+      - [x] **11.4.1 Remove `reevaluate_and_route()` from Ticker Loop (`executor.rs`):**
+        - ตัดการเรียก `reevaluate_and_route()` ออกจากจังหวะรับ Ticker Update เนื่องจากราคาตลาดไม่กระทบต่อยอดเหรียญ (Balance) และจุดที่สถานะเงินเปลี่ยน (Cancel, Fill, Balance WS, Live) มีตัวเรียก Reevaluate รองรับอยู่ครบถ้วนแล้ว
+        - ช่วยตัดการคำนวณซ้ำซ้อนระดับเสี้ยววินาที ลด CPU Load และตัดคอขวดใน Event Loop ทันที
+      - [x] **11.4.2 Retain Fallback Log as WARN (`simulate_cancel_plan.rs`):**
+        - คงระดับ Log `log::warn!` ไว้ตามเดิม เพื่อใช้ในการสังเกตการณ์ Flow และตรวจจับพฤติกรรมการ Fallback เมื่อทดสอบระบบจริง (เนื่องจากการตัด Reevaluate ออกจากรอบ Ticker ใน 11.4.1 ช่วยหยุดการเด้งรัวๆ ของ Log นี้ไปแล้ว)
+      - [x] **11.4.3 Race Condition Safety Verification:**
+        - ตรวจสอบว่าทุก Event ที่เงินหลุด (Cancel / Fill / Live Preemption) ยังคงทริกเกอร์ `reevaluate_and_route()` ได้ครบถ้วน 100% ไม่มีออเดอร์ค้างใน Parked
+
+

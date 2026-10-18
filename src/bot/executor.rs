@@ -481,9 +481,6 @@ impl BotExecutor {
                             }
 
                             if ticker.inst_id == pair {
-                                // เงินอาจว่างขึ้นจากบอทอื่น (cancel/fill) -> ปลุกตาม priority แล้ว route กลับเจ้าของ
-                                self.reevaluate_and_route().await;
-
                                 // ส่ง Ticker เข้า Strategy เพื่อประเมิน
                                 let actions = self.strategy_engine.on_ticker(&ticker);
 
