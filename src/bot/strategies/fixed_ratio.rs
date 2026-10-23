@@ -540,9 +540,13 @@ impl Strategy for FixedRatioStrategy {
     }
 
     fn pending_cancel_orders(&self) -> Vec<WsCancelOrderArg> {
+        // Clean Slate แบบ Legacy: กวาด Cancel ทุก order ที่บอทถืออยู่
+        // ทั้ง active (tracked) และ parked (กันเคสที่ order หลุดไป live บน exchange แต่ใน memory ถูกเข้าใจผิดว่าเป็น parked)
         self.tracked_buy
             .iter()
             .chain(self.tracked_sell.iter())
+            .chain(self.parked_buy.iter())
+            .chain(self.parked_sell.iter())
             .map(|order| WsCancelOrderArg {
                 inst_id: self.pair.clone(),
                 inst_id_code: self.get_inst_id_code(),

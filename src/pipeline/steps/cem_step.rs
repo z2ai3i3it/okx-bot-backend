@@ -264,10 +264,19 @@ impl CemManager {
     /// ยืนยันว่า order มีตัวตน live บน OKX แล้ว (มี order event สถานะ non-terminal)
     /// — เรียกจาก executor ทุกตัวที่เห็น event (idempotent)
     /// ใช้คัดผู้ถูก preempt: order ที่ place ยังไม่ confirm ห้ามถูก cancel plan เลือก
+    /// และถ้า order เคยถูกเข้าใจผิดว่าเป็น Parked (เช่น จาก cancel 51400 ที่วิ่งแซง place)
+    /// ให้ flip สถานะกลับเป็น Approved เพื่อให้ State ตรงกับ Exchange ที่เป็น Single Source of Truth
     pub async fn mark_order_live(&self, intent_id: &str) {
         let mut pool = self.tracked_orders.lock().await;
         if let Some(order) = pool.get_mut(intent_id) {
             order.live_confirmed = true;
+            if order.status == IntentStatus::Parked {
+                log::info!(
+                    "[CEM] 🛡️ [Live Confirmation] Order {} is confirmed LIVE on exchange — restoring status to Approved",
+                    intent_id
+                );
+                order.status = IntentStatus::Approved;
+            }
         }
     }
 

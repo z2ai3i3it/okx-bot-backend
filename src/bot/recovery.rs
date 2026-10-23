@@ -121,11 +121,12 @@ impl RecoveryEngine {
                     .await
                 {
                     Ok(detail) => detail,
-                    Err(OkxClientError::ApiError { code, .. }) if code == "51603" => {
+                    Err(OkxClientError::ApiError { code, .. }) if code == "51603" || code == "51400" => {
                         log::info!(
-                            "[Bot #{}] Order {} is no longer present on exchange",
+                            "[Bot #{}] Order {} is no longer present on exchange (code={})",
                             bot_id,
-                            cl_ord_id
+                            cl_ord_id,
+                            code
                         );
                         continue;
                     }
